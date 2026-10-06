@@ -25,10 +25,12 @@ pub use biomech::{cadence_for, fatigue_from_km, gait, ou_cadence_series, speed_f
 pub use graph::{point_in_polygon, Coord, RoadGraph};
 pub use kinematics::{pace_profile, speed_limit_ahead, KinParams};
 pub use load::{load_osm, parse_osm};
-pub use noise::{ar1_xy, GpsJitter};
+pub use noise::{ar1_xy, GpsJitter, JitterParams};
 pub use route::RouteOptions;
 pub use sdf::Sdf;
 pub use smooth::{turn_speed_limit, RoutePoint};
+
+pub use self::CloseMode as RouteCloseMode;
 
 /// 一条规划好的空间路线（度系采样点 + 总长）。
 #[derive(Clone, Debug)]
@@ -49,6 +51,102 @@ pub fn plan_route(
     opts: &RouteOptions,
 ) -> Result<Route, String> {
     plan_route_split(net, waypoints, &waypoints[1..], target_len_m, seed, opts)
+}
+
+/// 首尾走法（自定义路径 / 高德路径共用）。
+///
+/// - `Closed`：首尾相连成环（默认，跑圈）。
+/// - `RoundTrip`：原路返回（去程 + 回程，同一段路走两遍）。
+/// - `OneWay`：单程，仅从起点跑到终点，不回起点。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CloseMode {
+    /// 首尾相连成环。
+    #[default]
+    Closed,
+    /// 原路返回（往返）。
+    RoundTrip,
+    /// 单程（不回起点）。
+    OneWay,
+}
+
+impl CloseMode {
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "roundtrip" | "round-trip" | "return" | "往返" => CloseMode::RoundTrip,
+            "oneway" | "one-way" | "single" | "单程" => CloseMode::OneWay,
+            _ => CloseMode::Closed,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloseMode::Closed => "closed",
+            CloseMode::RoundTrip => "roundtrip",
+            CloseMode::OneWay => "oneway",
+        }
+    }
+
+    /// 是否回到起点（闭环 / 往返为真，单程为假）。
+    pub fn is_closed(self) -> bool {
+        !matches!(self, CloseMode::OneWay)
+    }
+}
+
+/// 入口（自定义折线）：按用户给定的经纬度顺序构建路线，**不做最短路径重排**。
+///
+/// 与 `plan_route` 的区别：几何源为折线本身而非路网拓扑，因此即使没有 OSM 路网
+/// 也能规划。行为：
+///   1. 过滤相邻重复点；
+///   2. 按 `close` 拼接走法：`Closed` 在末尾补回起点（闭合）；`RoundTrip` 追加逆序
+///      回程（原路返回）；`OneWay` 保持单程不回起点（`Route.points` 为开放折线）；
+///   3. 用给定切角半径 + 阈值对转角做圆弧平滑并按 `step_m` 重采样。
+///
+/// `threshold_deg` 为低于该角度的转角不切（保持直线）。
+pub fn plan_route_polyline(
+    waypoints: &[Coord],
+    close: CloseMode,
+    radius_m: f64,
+    threshold_deg: f64,
+    step_m: f64,
+) -> Result<Route, String> {
+    let mut pts: Vec<Coord> = Vec::with_capacity(waypoints.len() * 2 + 1);
+    for &c in waypoints {
+        if pts.last().map(|p| p.lon == c.lon && p.lat == c.lat) != Some(true) {
+            pts.push(c);
+        }
+    }
+    if pts.len() < 2 {
+        return Err("自定义路径至少需要 2 个不重复的点".into());
+    }
+    match close {
+        CloseMode::Closed => {
+            let first = pts[0];
+            let last = *pts.last().unwrap();
+            if first.lon != last.lon || first.lat != last.lat {
+                pts.push(first);
+            }
+        }
+        CloseMode::RoundTrip => {
+            // 去程 + 逆行回程；末点与回程首点重合，跳过以免零长段。
+            let rev: Vec<Coord> = pts[..pts.len() - 1].iter().rev().copied().collect();
+            pts.extend(rev);
+        }
+        CloseMode::OneWay => {}
+    }
+    let g = RoadGraph::from_polyline(&pts);
+    let radius = radius_m.max(0.5);
+    let points = smooth::smooth_and_sample(
+        &g,
+        &pts,
+        radius,
+        threshold_deg.clamp(0.0, 179.0),
+        step_m.max(0.1),
+    );
+    if points.is_empty() {
+        return Err("自定义路径平滑后为空（可能所有点重合）".into());
+    }
+    let length_m = points.last().map(|p| p.s).unwrap_or(0.0);
+    Ok(Route { points, length_m })
 }
 
 /// 入口（软/硬点分离）：`waypoints[0]` 为起点；`must` 为强制必经点（按序，不含

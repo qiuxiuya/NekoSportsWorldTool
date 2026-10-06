@@ -93,7 +93,14 @@ pub struct App {
     pub osm_page: osm::OsmPage,
     net_tx: Sender<Result<Arc<route_planner::RoadGraph>, String>>,
     net_rx: Receiver<Result<Arc<route_planner::RoadGraph>, String>>,
+    /// 高德步行规划后台结果：Ok((BD 折线, 沿路长度, 日志)) / Err((错误, 日志))。
+    amap_tx: Sender<AmapPlanResult>,
+    amap_rx: Receiver<AmapPlanResult>,
 }
+
+/// 高德步行规划后台任务回传（成功：BD 折线 + 长度；失败：错误信息；均附日志）。
+pub type AmapPlanResult =
+    Result<(Vec<(f64, f64)>, f64, Vec<String>), (String, Vec<String>)>;
 
 impl eframe::App for App {
     #[cfg(target_os = "android")]
@@ -312,6 +319,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let (net_tx, net_rx) = std::sync::mpsc::channel();
+        let (amap_tx, amap_rx) = std::sync::mpsc::channel();
         let font_loaded = fonts::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
         let identity = model::load_identity();
@@ -321,6 +329,8 @@ impl App {
         let username = config.username.clone();
         let password = config.password.clone();
         let remember = config.remember;
+        let custom_route_text = model::load_custom_route();
+        let route_mode = crate::track::generate_road::RouteMode::from_str(&config.route_mode);
 
         let mut app = Self {
             tx: tx.clone(),
@@ -350,22 +360,46 @@ impl App {
                 dist_max: config.dist_max,
                 pace_min: config.pace_min,
                 pace_max: config.pace_max,
-                manual_altitude: config
+                gps_drift_m: config.gps_drift_m,
+                manual_altitude_on: config.manual_altitude.is_some()
+                    || config.manual_altitude_range.is_some(),
+                manual_altitude_min: config
                     .manual_altitude_range
-                    .map(|r| format!("{}-{}", r.min_m, r.max_m))
-                    .or_else(|| config.manual_altitude.map(|v| v.to_string()))
-                    .unwrap_or_default(),
+                    .map(|r| r.min_m)
+                    .or(config.manual_altitude)
+                    .unwrap_or(0.0) as f32,
+                manual_altitude_max: config
+                    .manual_altitude_range
+                    .map(|r| r.max_m)
+                    .or(config.manual_altitude)
+                    .unwrap_or(0.0) as f32,
                 start_mode: 0,
                 days_ago: 0,
                 hour: 12,
                 minute: 0,
                 face_check: config.face_check,
                 plan: None,
-                route_mode: crate::track::generate_road::RouteMode::from_str(&config.route_mode),
+                route_mode,
                 map: map::MapState::default(),
                 preview: None,
                 preview_stale: true,
                 map_fitted: false,
+                custom_path: config.custom_route_path.clone(),
+                custom_text: custom_route_text,
+                custom_datum: crate::track::custom::Datum::from_str(&config.custom_datum),
+                custom_use_buildings: config.custom_use_buildings,
+                custom_msg: String::new(),
+                custom_points_bd: None,
+                custom_dirty: true,
+                custom_text_seen: String::new(),
+                last_route_mode: route_mode,
+                custom_close: crate::track::generate_road::PathClose::from_str(&config.custom_close),
+                amap_key: config.amap_key.clone(),
+                amap_jscode: config.amap_security_js_code.clone(),
+                amap_points_bd: None,
+                amap_busy: false,
+                amap_msg: String::new(),
+                amap_plan_requested: false,
             },
             ai_page: ai::AiPage {
                 days: 1,
@@ -384,6 +418,8 @@ impl App {
             },
             net_tx,
             net_rx,
+            amap_tx,
+            amap_rx,
         };
         if app.font_loaded.is_none() {
             app.log

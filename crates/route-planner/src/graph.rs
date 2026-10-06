@@ -89,6 +89,19 @@ impl RoadGraph {
         }
     }
 
+    /// 从一条折线（度系）构造最小工作图：节点锚点 + 米制缩放。
+    ///
+    /// 仅用于等距投影与平滑重采样（无需真实边拓扑），因此只放置节点、不建边，
+    /// 也不构建空间索引（`nearest_edge` 不会被调用）。
+    pub fn from_polyline(pts: &[Coord]) -> Self {
+        let mut g = RoadGraph::new();
+        for &c in pts {
+            g.add_node(c);
+        }
+        g.compute_anchor();
+        g
+    }
+
     /// 度 → 米制平面（相对锚点）。
     pub fn to_m(&self, c: Coord) -> [f64; 2] {
         [

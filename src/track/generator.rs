@@ -9,6 +9,21 @@
 use super::geom::{fmt_gain_time, make_point_ring, ring_point_at, round_to, to_bd, Rng, MET_PER_DEG_LAT, MET_PER_DEG_LNG};
 use super::model::{GenPoint, Segment, TenWindow, Track};
 use super::postfix::apply_post_fixes;
+use route_planner::{GpsJitter, JitterParams};
+
+/// 到最近配置路径点（BD 系）的平面距离（米），用于漂移软回拉。
+fn nearest_anchor_dist(pts: &[(f64, f64)], c_lat: f64, c_lng: f64, x: f64, y: f64) -> f64 {
+    let mut best = f64::INFINITY;
+    for &(la, lo) in pts {
+        let dx = (lo - c_lng) * MET_PER_DEG_LNG - x;
+        let dy = (la - c_lat) * MET_PER_DEG_LAT - y;
+        let d = (dx * dx + dy * dy).sqrt();
+        if d < best {
+            best = d;
+        }
+    }
+    best
+}
 
 /// 有效配速窗口（判定规则 2'21"-10'00"/km ≈ 1.667-7.092 m/s），硬边界留余量。
 pub const SPEED_FLOOR: f64 = 1.90;
@@ -32,7 +47,7 @@ fn fit_speeds(w: &mut [f64], dts: &[f64], target: f64) {
     }
 }
 
-/// 轨迹生成主入口。points_bd 为 BD 系打卡点。
+/// 轨迹生成主入口。points_bd 为 BD 系打卡点；drift_m 为 GPS 漂移距离（米，相关漂移稳态幅度）。
 pub fn build(
     dist: f64,
     dur: i64,
@@ -40,6 +55,7 @@ pub fn build(
     _center: (f64, f64),
     start_ms: i64,
     points_bd: &[(f64, f64)],
+    drift_m: f64,
 ) -> Track {
     let mut rng = Rng::new(seed);
     let dur_f = dur as f64;
@@ -147,8 +163,8 @@ pub fn build(
     let mut t_acc = 0.0f64;
     let mut dist_acc = 0.0f64;
     let mut steps_acc = 0.0f64;
-    let mut jx = 0.0f64;
-    let mut jy = 0.0f64;
+    // GPS 抖动：AR(1) 走廊各向异性 + 锚点软回拉（范围由 drift_m 决定）
+    let mut jitter = GpsJitter::with_params(JitterParams::from_drift_m(drift_m));
     let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
     let n_est = 1.max((dur_f / 5.0) as i64);
     let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
@@ -176,10 +192,19 @@ pub fn build(
             let (bx, by) = pos(s);
             x = bx;
             y = by;
-            jx = 0.72 * jx + rng.gauss(0.0, 0.75);
-            jy = 0.72 * jy + rng.gauss(0.0, 0.75);
-            px = bx + jx;
-            py = by + jy;
+            // 行进切线作为走廊主轴（抑制沿路抖动，放大横向遮挡漂移）
+            let (tx, ty) = pos(s + direction * 2.0);
+            let tangent = Some([tx - bx, ty - by]);
+            let near = nearest_anchor_dist(points_bd, c_lat, c_lng, bx, by);
+            let z = [
+                rng.gauss(0.0, 1.0),
+                rng.gauss(0.0, 1.0),
+                rng.gauss(0.0, 1.0),
+                rng.gauss(0.0, 1.0),
+            ];
+            let (jxd, jyd) = jitter.step(1.0, tangent, near, z);
+            px = bx + jxd;
+            py = by + jyd;
             rad = round_to(
                 if typ == 3 { rng.uniform(1.4, 5.1) } else { rng.uniform(1.4, 2.4) },
                 2,
@@ -219,6 +244,7 @@ pub fn build(
                 py = (last.gLat - c_lat) * MET_PER_DEG_LAT;
                 px = (last.gLng - c_lng) * MET_PER_DEG_LNG;
             } else {
+                let (jx, jy) = jitter.state();
                 px = x + jx;
                 py = y + jy;
             }
@@ -366,8 +392,12 @@ pub fn build(
         }
         if let Some(i) = best_i {
             if best_d < 40.0 * 40.0 {
+                // 吸附前记录与漂移轨迹的残差，吸附后同步抖动状态，避免下一点弹跳
+                let rx = (locs[i].gLng - pl.1) * MET_PER_DEG_LNG;
+                let ry = (locs[i].gLat - pl.0) * MET_PER_DEG_LAT;
                 locs[i].gLat = round_to(pl.0, 7);
                 locs[i].gLng = round_to(pl.1, 7);
+                jitter.resync((rx, ry));
             }
         }
     }

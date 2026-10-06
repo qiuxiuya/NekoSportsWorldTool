@@ -104,10 +104,15 @@ impl App {
         });
     }
 
-    /// 后台拉取实时点位并落盘（供路线预览使用），完成后触发预览刷新。
-    /// 复用 fetch_points 的 TTL 缓存，仅在 Road 模式且锚点已配置时拉取。
+    /// 后台拉取实时点位（检查点）并落盘。
+    ///
+    /// Road 模式供路线预览；Amap 模式用作高德步行规划的路径点。
+    /// 复用 fetch_points 的 TTL 缓存，仅这两种模式且锚点已配置时拉取。
     pub(crate) fn refresh_points(&self) {
-        if self.run_page.route_mode != RouteMode::Road {
+        if !matches!(
+            self.run_page.route_mode,
+            RouteMode::Road | RouteMode::Amap
+        ) {
             return;
         }
         let Some(session) = self.session.clone() else {
@@ -120,15 +125,20 @@ impl App {
         let Ok(anchor) = identity.anchor_coordinate() else {
             return;
         };
+        let purpose = if self.run_page.route_mode == RouteMode::Amap {
+            "供高德路径规划"
+        } else {
+            "供路线预览"
+        };
         self.spawn_job(move |tx| {
             let mut log = App::logger(tx.clone());
             let mut client = crate::api::client::ApiClient::new(identity, Some(session));
             match crate::api::points::fetch_points(&mut client, anchor, &mut log) {
                 Ok(pts) => {
-                    log(&format!("√ [points] 点位已缓存 {} 个（供路线预览）", pts.len()));
+                    log(&format!("√ [points] 检查点已缓存 {} 个（{purpose}）", pts.len()));
                     tx.send(POINTS_DONE.to_string()).ok();
                 }
-                Err(e) => log(&format!("⚠ [points] 点位获取失败: {e}")),
+                Err(e) => log(&format!("⚠ [points] 检查点获取失败: {e}")),
             }
         });
     }

@@ -2386,6 +2386,7 @@ dependencies = [
  "jni 0.21.1",
  "log",
  "md-5",
+ "quick-xml 0.41.0",
  "rand 0.8.8",
  "rand_distr",
  "rfd",

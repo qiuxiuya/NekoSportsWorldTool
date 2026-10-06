@@ -123,9 +123,99 @@ fn cmd_run(rest: &[&str]) -> i32 {
         seed
     };
     let cfg = model::load_config();
-    let route_mode = crate::track::generate_road::RouteMode::from_str(
-        get(&flags, "route").unwrap_or(&cfg.route_mode),
-    );
+    use crate::track::generate_road::{PathClose, RouteMode};
+    let route_mode = RouteMode::from_str(get(&flags, "route").unwrap_or(&cfg.route_mode));
+    // 首尾走法：--close closed|roundtrip|oneway。
+    let close = PathClose::from_str(get(&flags, "close").unwrap_or(&cfg.custom_close));
+    // 自定义 / 高德路径：--custom <文件>（GPX/GeoJSON/文本）；--datum wgs84|gcj02|bd09。
+    // 未提供 --custom 时回退已保存的 custom_route.txt。
+    let custom_route = if route_mode.is_polyline_based() {
+        let datum =
+            crate::track::custom::Datum::from_str(get(&flags, "datum").unwrap_or(&cfg.custom_datum));
+        let text = match get(&flags, "custom") {
+            Some(path) => match std::fs::read_to_string(path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("--custom 读取失败: {e}");
+                    return 1;
+                }
+            },
+            None => model::load_custom_route(),
+        };
+        if text.trim().is_empty() {
+            eprintln!("路径为空：请提供 --custom <文件>，或在桌面端填写后重试");
+            return 1;
+        }
+        let parsed = match crate::track::custom::parse_route(&text, datum) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("路径解析失败: {e}");
+                return 1;
+            }
+        };
+        let points_bd = if route_mode == RouteMode::Amap {
+            // 高德模式：把路径点交给高德按步行道路规划，得到沿路折线（BD-09）。
+            let amap_cfg = crate::api::amap::AmapConfig {
+                key: get(&flags, "amap-key")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| cfg.amap_key.clone()),
+                jscode: get(&flags, "amap-jscode")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| cfg.amap_security_js_code.clone()),
+            };
+            if !amap_cfg.is_ready() {
+                eprintln!("高德模式需提供 --amap-key（或在桌面端保存 Key）");
+                return 1;
+            }
+            // 解析得到的点为所选基准 → BD-09，再转回 GCJ-02 交给高德。
+            let mut seq_gcj: Vec<(f64, f64)> = parsed
+                .points_bd
+                .iter()
+                .map(|&(la, lo)| crate::track::wire::bd09_to_gcj02(la, lo))
+                .collect();
+            match close {
+                PathClose::Closed => {
+                    let first = seq_gcj[0];
+                    let last = *seq_gcj.last().unwrap();
+                    if (first.0 - last.0).abs() > 1e-9 || (first.1 - last.1).abs() > 1e-9 {
+                        seq_gcj.push(first);
+                    }
+                }
+                PathClose::RoundTrip => {
+                    let mut back: Vec<(f64, f64)> =
+                        seq_gcj[..seq_gcj.len() - 1].iter().rev().copied().collect();
+                    seq_gcj.append(&mut back);
+                }
+                PathClose::OneWay => {}
+            }
+            let mut lg = |s: &str| println!("{s}");
+            match crate::api::amap::plan_walking(&amap_cfg, &seq_gcj, &mut lg) {
+                Ok(r) => {
+                    println!("高德步行路径：{} 点，约 {:.0} m", r.points_bd.len(), r.length_m);
+                    r.points_bd
+                }
+                Err(e) => {
+                    eprintln!("高德步行规划失败: {e}");
+                    return 1;
+                }
+            }
+        } else {
+            println!("自定义路径：{} · {} 个点", parsed.format, parsed.points_bd.len());
+            parsed.points_bd
+        };
+        let buildings_bd = if cfg.custom_use_buildings {
+            crate::track::generate_road::load_buildings_bd(&cfg.osm_path)
+        } else {
+            Vec::new()
+        };
+        Some(crate::api::flow::CustomRoute {
+            points_bd,
+            buildings_bd,
+            close,
+        })
+    } else {
+        None
+    };
 
     let dist = if dist_km > 0.0 {
         dist_km as f64 * 1000.0
@@ -168,6 +258,7 @@ fn cmd_run(rest: &[&str]) -> i32 {
     );
 
     let mut log = logger();
+    let gps_drift_m = cfg.gps_drift_m as f64;
     let params = crate::api::flow::RunParams {
         dist,
         dur,
@@ -177,6 +268,8 @@ fn cmd_run(rest: &[&str]) -> i32 {
         manual_altitude_range,
         seed,
         route_mode,
+        custom_route,
+        gps_drift_m,
     };
     match crate::api::flow::run_full_flow(&mut client, &params, &mut log) {
         Ok(out) => {
@@ -467,6 +560,9 @@ fn cmd_obs_sample(rest: &[&str]) -> i32 {
     };
     let pts_bd = crate::api::points::points_bd(&pts);
     let start_ms = crate::crypto::envelope::now_ms() - dur * 1000;
+    let drift_m = get(&flags, "drift")
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1.5);
     let track = crate::track::generator::build(
         dist,
         dur,
@@ -474,6 +570,7 @@ fn cmd_obs_sample(rest: &[&str]) -> i32 {
         (anchor.latitude, anchor.longitude),
         start_ms,
         &pts_bd,
+        drift_m,
     );
     let sess = client.login.clone().unwrap_or_default();
     let uuid = uuid::Uuid::new_v4().to_string().to_uppercase();

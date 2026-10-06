@@ -26,19 +26,51 @@ pub fn parse_spec(text: &str) -> Result<Option<AltitudeSpec>, String> {
     if text.is_empty() {
         return Ok(None);
     }
+    // 先尝试整体解析：允许负海拔单值（如 "-15"），避免负号被误当作区间分隔符。
+    if let Ok(v) = text.parse::<f64>() {
+        validate_altitude(v)?;
+        return Ok(Some(AltitudeSpec::Single(v)));
+    }
     if let Some((left, right)) = text.split_once('-') {
         let min_m = left.trim().parse::<f64>().map_err(|_| "手动海拔区间格式应为 min-max，例如 11.6-22.8".to_string())?;
         let max_m = right.trim().parse::<f64>().map_err(|_| "手动海拔区间格式应为 min-max，例如 11.6-22.8".to_string())?;
         return Ok(Some(AltitudeSpec::Range(validate_range(min_m, max_m)?)));
     }
-    let altitude_m = text.parse::<f64>().map_err(|_| "手动海拔应为数字或 min-max 区间，例如 17.2 或 11.6-22.8".to_string())?;
-    validate_altitude(altitude_m)?;
-    Ok(Some(AltitudeSpec::Single(altitude_m)))
+    Err("手动海拔应为数字或 min-max 区间，例如 17.2 或 11.6-22.8".to_string())
+}
+
+/// 由两个输入框（最小值 / 最大值）解析海拔。
+///
+/// 两个都为空 → 不使用覆盖；只填最小值 → 单值绝对海拔；两者都填 → 区间映射。
+/// 支持负海拔（低于海平面，如 -15）。
+pub fn parse_fields(min_text: &str, max_text: &str) -> Result<Option<AltitudeSpec>, String> {
+    let min_t = min_text.trim();
+    let max_t = max_text.trim();
+    if min_t.is_empty() && max_t.is_empty() {
+        return Ok(None);
+    }
+    if max_t.is_empty() {
+        let v = min_t
+            .parse::<f64>()
+            .map_err(|_| "海拔应为数字".to_string())?;
+        validate_altitude(v)?;
+        return Ok(Some(AltitudeSpec::Single(v)));
+    }
+    if min_t.is_empty() {
+        return Err("请同时填写海拔区间的最小值".into());
+    }
+    let min_m = min_t
+        .parse::<f64>()
+        .map_err(|_| "海拔区间最小值应为数字".to_string())?;
+    let max_m = max_t
+        .parse::<f64>()
+        .map_err(|_| "海拔区间最大值应为数字".to_string())?;
+    Ok(Some(AltitudeSpec::Range(validate_range(min_m, max_m)?)))
 }
 
 fn validate_altitude(altitude_m: f64) -> Result<(), String> {
     if !altitude_m.is_finite() || !(-500.0..=9000.0).contains(&altitude_m) {
-        return Err("手动海拔必须是 -500 到 9000 米之间的数字".into());
+        return Err("海拔必须是 -500 到 9000 米之间的数字（允许负值，如低于海平面）".into());
     }
     Ok(())
 }
@@ -92,6 +124,8 @@ mod tests {
     use super::*;
     use crate::api::submit::total_ascent;
     use crate::track::generator::build;
+    // 测试统一使用默认漂移距离
+    const DRIFT_M: f64 = 1.5;
 
     fn points() -> Vec<(f64, f64)> {
         vec![(38.901678, 121.540241), (38.902564, 121.541233)]
@@ -99,7 +133,7 @@ mod tests {
 
     #[test]
     fn override_replaces_every_bd_a_and_clears_ascent() {
-        let mut track = build(1200.0, 600, 7, (38.9, 121.54), 1_700_000_000_000, &points());
+        let mut track = build(1200.0, 600, 7, (38.9, 121.54), 1_700_000_000_000, &points(), DRIFT_M);
         override_bd_a(&mut track, 36.75).unwrap();
         assert!(track.locations.iter().all(|p| p.bdA == 36.75));
         assert_eq!(total_ascent(&track.locations), 0.0);
@@ -107,7 +141,7 @@ mod tests {
 
     #[test]
     fn rejects_non_finite_or_out_of_range_values() {
-        let mut track = build(1000.0, 500, 1, (38.9, 121.54), 1_700_000_000_000, &points());
+        let mut track = build(1000.0, 500, 1, (38.9, 121.54), 1_700_000_000_000, &points(), DRIFT_M);
         assert!(override_bd_a(&mut track, f64::NAN).is_err());
         assert!(override_bd_a(&mut track, 9001.0).is_err());
     }
@@ -119,9 +153,36 @@ mod tests {
         assert!(parse_spec("22.8-11.6").is_err());
     }
 
+    /// 允许负海拔（低于海平面），超出下限才报错。
+    #[test]
+    fn accepts_negative_altitude() {
+        assert_eq!(parse_spec("-15").unwrap(), Some(AltitudeSpec::Single(-15.0)));
+        let mut track =
+            build(1000.0, 500, 1, (38.9, 121.54), 1_700_000_000_000, &points(), DRIFT_M);
+        override_bd_a(&mut track, -15.0).unwrap();
+        assert!(track.locations.iter().all(|p| p.bdA == -15.0));
+        // 超出下限（-500）仍报错
+        assert!(parse_spec("-600").is_err());
+    }
+
+    /// 两个输入框解析：空/单值/区间（含负值）。
+    #[test]
+    fn parses_fields_pair() {
+        assert_eq!(parse_fields("", "").unwrap(), None);
+        assert_eq!(parse_fields("17.2", "").unwrap(), Some(AltitudeSpec::Single(17.2)));
+        assert_eq!(parse_fields("-15", "").unwrap(), Some(AltitudeSpec::Single(-15.0)));
+        assert_eq!(
+            parse_fields("11.6", "22.8").unwrap(),
+            Some(AltitudeSpec::Range(AltitudeRange { min_m: 11.6, max_m: 22.8 }))
+        );
+        // 只填最大值、区间倒挂应报错
+        assert!(parse_fields("", "22.8").is_err());
+        assert!(parse_fields("22.8", "11.6").is_err());
+    }
+
     #[test]
     fn range_mapping_stays_inside_requested_bounds() {
-        let mut track = build(1200.0, 600, 7, (38.9, 121.54), 1_700_000_000_000, &points());
+        let mut track = build(1200.0, 600, 7, (38.9, 121.54), 1_700_000_000_000, &points(), DRIFT_M);
         override_bd_a_range(&mut track, AltitudeRange { min_m: 11.6, max_m: 22.8 }).unwrap();
         assert!(track.locations.iter().all(|p| (11.6..=22.8).contains(&p.bdA)));
     }

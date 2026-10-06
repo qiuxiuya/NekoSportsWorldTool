@@ -2,6 +2,7 @@
 
 pub mod altitude;
 pub mod calorie;
+pub mod custom;
 pub mod generate_road;
 pub mod generator;
 pub mod geom;
@@ -85,7 +86,8 @@ mod tests {
         let pts = sample_points();
         let net = road_grid();
         let start = 1_788_958_186_123i64;
-        let track = build_road(3300.0, 1220, 42, start, &pts, &pts[1..], &net).expect("build_road");
+        let track =
+            build_road(3300.0, 1220, 42, start, &pts, &pts[1..], &net, 1.5).expect("build_road");
         assert!(
             (track.totalDistance - 3300.0).abs() < 0.5,
             "dist={}",
@@ -105,7 +107,7 @@ mod tests {
     fn test_generator_distribution() {
         let pts = sample_points();
         let start = 1_788_958_186_123i64;
-        let track = build(3300.0, 1220, 42, (38.9, 121.54), start, &pts);
+        let track = build(3300.0, 1220, 42, (38.9, 121.54), start, &pts, 1.5);
         // 总距离精确等于目标（±0.5m 舍入容差）
         assert!(
             (track.totalDistance - 3300.0).abs() < 0.5,
@@ -163,7 +165,7 @@ mod tests {
     #[test]
     fn test_point_snapping() {
         let pts = sample_points();
-        let track = build(2200.0, 900, 7, (38.9, 121.54), 1_788_958_186_123, &pts);
+        let track = build(2200.0, 900, 7, (38.9, 121.54), 1_788_958_186_123, &pts, 1.5);
         for pl in &pts {
             let min_m = track
                 .locations
@@ -192,7 +194,7 @@ mod tests {
         ];
         for seed in 0..16u64 {
             for &(dist, dur) in &combos {
-                let t = build(dist, dur, seed, (38.9, 121.54), 1_788_958_186_123, &pts);
+                let t = build(dist, dur, seed, (38.9, 121.54), 1_788_958_186_123, &pts, 1.5);
                 for (i, w) in t.speedPerTenSec.iter().enumerate() {
                     let pace = 1000.0 / (w.value / 10.0); // 秒/km
                     assert!(
@@ -289,6 +291,7 @@ mod tests {
             (38.9, 121.54),
             1_788_958_186_123,
             &sample_points(),
+            1.5,
         );
         let obj = build_obs_object(&track, 1320403809, "UUID-TEST", 13056447, &pts);
         let keys: Vec<&str> = obj
@@ -341,5 +344,87 @@ mod tests {
         assert_eq!(ks.len(), 2);
         assert!(ks[0].contains("run_data/"));
         assert!(ks[1].starts_with("run_data/1320/1320403809.json"));
+    }
+
+    /// 自定义路径三种走法：单程最短、闭环含回路、往返约为单程两倍。
+    #[test]
+    fn test_custom_close_modes() {
+        use super::generate_road::{plan_custom_view, PathClose};
+        // 约 111m × 87m 的方形折线（BD 系），四角 90° 会触发切角但不改比例关系。
+        let pts = vec![
+            (38.900000, 121.500000),
+            (38.901000, 121.500000),
+            (38.901000, 121.501000),
+            (38.900000, 121.501000),
+        ];
+        let one = plan_custom_view(&pts, PathClose::OneWay, &[])
+            .unwrap()
+            .length_m;
+        let round = plan_custom_view(&pts, PathClose::RoundTrip, &[])
+            .unwrap()
+            .length_m;
+        let closed = plan_custom_view(&pts, PathClose::Closed, &[])
+            .unwrap()
+            .length_m;
+        assert!(one > 200.0, "单程长度异常 {one}");
+        // 折返点的 180° 掉头圆弧会吃掉少量长度，故允许 1.7~2.2 倍区间。
+        assert!(
+            round > one * 1.7 && round < one * 2.2,
+            "往返应约为单程两倍：one={one} round={round}"
+        );
+        assert!(
+            closed > one && closed < round,
+            "闭环应介于单程与往返之间：one={one} closed={closed} round={round}"
+        );
+    }
+
+    /// 高德 / 自定义折线走法：单程不回起点（首尾不重合），闭环首尾重合。
+    #[test]
+    fn test_custom_path_endpoints() {
+        use super::generate_road::{plan_custom_view, PathClose};
+        let pts = vec![
+            (38.900000, 121.500000),
+            (38.901000, 121.500000),
+            (38.901000, 121.501000),
+        ];
+        let open = plan_custom_view(&pts, PathClose::OneWay, &[]).unwrap();
+        let first = open.route.first().copied().unwrap();
+        let last = open.route.last().copied().unwrap();
+        let d = ((first.0 - last.0) * MET_PER_DEG_LAT).hypot((first.1 - last.1) * MET_PER_DEG_LNG);
+        assert!(d > 50.0, "单程不应回到起点，实际相距 {d}m");
+
+        let looped = plan_custom_view(&pts, PathClose::Closed, &[]).unwrap();
+        let f = looped.route.first().copied().unwrap();
+        let l = looped.route.last().copied().unwrap();
+        let dl = ((f.0 - l.0) * MET_PER_DEG_LAT).hypot((f.1 - l.1) * MET_PER_DEG_LNG);
+        assert!(dl < 5.0, "闭环应回到起点附近，实际相距 {dl}m");
+    }
+
+    /// 自定义路径轨迹：距离精确、步数为正、哨兵语义与路网模式一致。
+    #[test]
+    fn test_build_custom_track() {
+        use super::generate_road::{build_custom, PathClose};
+        let pts = vec![
+            (38.900000, 121.500000),
+            (38.901000, 121.500000),
+            (38.901000, 121.501000),
+            (38.900000, 121.501000),
+        ];
+        let start = 1_788_958_186_123i64;
+        for close in [PathClose::Closed, PathClose::RoundTrip, PathClose::OneWay] {
+            let track =
+                build_custom(1500.0, 600, 7, start, &pts, close, &[], 1.5).expect("build_custom");
+            assert!(
+                (track.totalDistance - 1500.0).abs() < 1.0,
+                "close={close:?} dist={}",
+                track.totalDistance
+            );
+            assert_eq!(track.totalTime, 600);
+            assert!(!track.locations.is_empty());
+            assert!([0, 7].contains(&track.locations[0].ptype));
+            assert_eq!(track.locations[1].ptype, 5);
+            assert_eq!(track.locations.last().unwrap().ptype, 6);
+            assert!(track.totalSteps > 100, "steps={}", track.totalSteps);
+        }
     }
 }

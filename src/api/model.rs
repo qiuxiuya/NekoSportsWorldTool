@@ -77,9 +77,38 @@ pub struct Config {
     /// OSM 路网文件路径（真实道路路由用）。
     #[serde(default)]
     pub osm_path: String,
-    /// 路线算法：legacy | road。
+    /// 路线算法：legacy | road | custom。
     #[serde(default = "default_route_mode")]
     pub route_mode: String,
+    /// 最近一次导入的自定义路径文件路径（仅作提示/回填，内容另行持久化）。
+    #[serde(default)]
+    pub custom_route_path: String,
+    /// 自定义路径导入坐标基准：wgs84 | gcj02 | bd09。
+    #[serde(default = "default_datum")]
+    pub custom_datum: String,
+    /// 自定义路径是否使用已导入的 OSM 路网建筑做 GPS 漂移 SDF 放大。
+    #[serde(default)]
+    pub custom_use_buildings: bool,
+    /// GPS 漂移距离（米）：相关漂移的稳态幅度，越大轨迹越"松"。
+    #[serde(default = "default_gps_drift_m")]
+    pub gps_drift_m: f32,
+    /// 首尾走法：closed | roundtrip | oneway（自定义 / 高德共用）。
+    #[serde(default = "default_close")]
+    pub custom_close: String,
+    /// 高德 Web 服务 Key（高德路径规划用）。
+    #[serde(default)]
+    pub amap_key: String,
+    /// 高德安全密钥 securityJsCode（未启用安全密钥时留空）。
+    #[serde(default)]
+    pub amap_security_js_code: String,
+}
+
+fn default_close() -> String {
+    "closed".into()
+}
+
+fn default_datum() -> String {
+    "wgs84".into()
 }
 
 fn default_route_mode() -> String {
@@ -104,6 +133,9 @@ fn default_ai_reps() -> i64 {
 fn default_update_check() -> String {
     "silent".into()
 }
+fn default_gps_drift_m() -> f32 {
+    1.5
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -123,6 +155,13 @@ impl Default for Config {
             update_check: default_update_check(),
             osm_path: String::new(),
             route_mode: default_route_mode(),
+            custom_route_path: String::new(),
+            custom_datum: default_datum(),
+            custom_use_buildings: true,
+            gps_drift_m: default_gps_drift_m(),
+            custom_close: default_close(),
+            amap_key: String::new(),
+            amap_security_js_code: String::new(),
         }
     }
 }
@@ -230,6 +269,16 @@ pub fn load_session() -> Session {
 
 pub fn save_session(s: &Session) -> Result<(), String> {
     write_json("session.json", s)
+}
+
+/// 自定义路径文本（custom_route.txt）：导入或手输的原始内容，跨启动保留。
+pub fn load_custom_route() -> String {
+    std::fs::read_to_string(exe_dir().join("custom_route.txt")).unwrap_or_default()
+}
+
+pub fn save_custom_route(text: &str) -> Result<(), String> {
+    let path = exe_dir().join("custom_route.txt");
+    std::fs::write(&path, text).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
 }
 
 pub fn clear_session() {

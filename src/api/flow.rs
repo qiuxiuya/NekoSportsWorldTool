@@ -14,7 +14,18 @@ use crate::track::wire::{build_obs_object, five_point_wrapper, obs_keys};
 use rand_distr::{Distribution, Normal};
 use serde_json::Value;
 
-#[derive(Clone, Copy)]
+/// 自定义 / 高德路径（BD-09 折线）与所选建筑 SDF 数据。
+///
+/// `points_bd` 为用户给定顺序的坐标（已转 BD-09）；`buildings_bd` 可为空；
+/// `close` 为首尾走法（循环 / 往返 / 单程）。
+#[derive(Clone, Debug, Default)]
+pub struct CustomRoute {
+    pub points_bd: Vec<(f64, f64)>,
+    pub buildings_bd: Vec<Vec<(f64, f64)>>,
+    pub close: crate::track::generate_road::PathClose,
+}
+
+#[derive(Clone)]
 pub struct RunParams {
     /// 距离（米）与时长（秒）已由 UI 参数解析。
     pub dist: f64,
@@ -29,6 +40,10 @@ pub struct RunParams {
     pub seed: u64,
     /// 路线算法模式。
     pub route_mode: RouteMode,
+    /// 自定义路径（仅 `RouteMode::Custom` 使用）；None 或点不足时回退经典算法。
+    pub custom_route: Option<CustomRoute>,
+    /// GPS 漂移距离（米）：相关漂移稳态幅度。
+    pub gps_drift_m: f64,
 }
 
 pub struct RunOutcome {
@@ -141,7 +156,7 @@ pub fn run_full_flow(
         }
     }
     // 平均配速须落在有效窗口内（否则逐点速度无法全窗内），越界时修正时长
-    let mut params = *params;
+    let mut params = params.clone();
     let avg = params.dist / params.dur as f64;
     let fixed_avg = avg.clamp(
         crate::track::generator::SPEED_FLOOR + 0.1,
@@ -177,6 +192,7 @@ pub fn run_full_flow(
                     (anchor.latitude, anchor.longitude),
                     start_ms,
                     &pts_bd,
+                    params.gps_drift_m,
                 )
             } else {
                 match crate::track::generate_road::load_network_path(&cfg.osm_path) {
@@ -206,6 +222,7 @@ pub fn run_full_flow(
                             &route_pts,
                             &must_bd,
                             &filtered,
+                            params.gps_drift_m,
                         ) {
                             Ok(t) => {
                                 log(&format!(
@@ -225,6 +242,7 @@ pub fn run_full_flow(
                                     (anchor.latitude, anchor.longitude),
                                     start_ms,
                                     &pts_bd,
+                                    params.gps_drift_m,
                                 )
                             }
                         }
@@ -238,11 +256,61 @@ pub fn run_full_flow(
                             (anchor.latitude, anchor.longitude),
                             start_ms,
                             &pts_bd,
+                            params.gps_drift_m,
                         )
                     }
                 }
             }
         }
+        // 自定义路径与高德路径几何源一致：均为按给定折线走。
+        RouteMode::Custom | RouteMode::Amap => match params.custom_route.as_ref() {
+            Some(cr) if cr.points_bd.len() >= 2 => {
+                match crate::track::generate_road::build_custom(
+                    params.dist,
+                    params.dur,
+                    params.seed,
+                    start_ms,
+                    &cr.points_bd,
+                    cr.close,
+                    &cr.buildings_bd,
+                    params.gps_drift_m,
+                ) {
+                    Ok(t) => {
+                        log(&format!(
+                            "√ [track] 折线路径 {} 点 / {} 建筑 / {}",
+                            t.locations.len(),
+                            cr.buildings_bd.len(),
+                            cr.close.label()
+                        ));
+                        t
+                    }
+                    Err(e) => {
+                        log(&format!("⚠ [track] 折线路径生成失败，回退经典算法: {e}"));
+                        gen_track(
+                            params.dist,
+                            params.dur,
+                            params.seed,
+                            (anchor.latitude, anchor.longitude),
+                            start_ms,
+                            &pts_bd,
+                            params.gps_drift_m,
+                        )
+                    }
+                }
+            }
+            _ => {
+                log("⚠ [track] 折线路径未配置或有效点不足，回退经典算法");
+                gen_track(
+                    params.dist,
+                    params.dur,
+                    params.seed,
+                    (anchor.latitude, anchor.longitude),
+                    start_ms,
+                    &pts_bd,
+                    params.gps_drift_m,
+                )
+            }
+        },
         RouteMode::Legacy => gen_track(
             params.dist,
             params.dur,
@@ -250,6 +318,7 @@ pub fn run_full_flow(
             (anchor.latitude, anchor.longitude),
             start_ms,
             &pts_bd,
+            params.gps_drift_m,
         ),
     };
     if let Some(range) = params.manual_altitude_range {

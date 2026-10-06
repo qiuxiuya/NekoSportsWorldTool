@@ -136,6 +136,46 @@ fn native_text_button(
     response
 }
 
+/// 多行文本编辑（自定义路径 / GPX / GeoJSON 等长文本输入）。
+///
+/// 桌面：多行 TextEdit 包在**限高滚动区**内 —— 内容再长（如整份 GPX）也不会
+/// 把编辑框撑满整屏；Android：原生输入桥仅支持单行，退化为单行输入
+/// （格式仍可用 `;` / `|` 在同一行分隔多个点）。
+///
+/// 返回是否获得焦点（供调用方判断，通常可忽略）。
+pub fn text_edit_multiline(
+    ui: &mut egui::Ui,
+    id_source: impl Hash,
+    value: &mut String,
+    desired_rows: usize,
+    max_height: f32,
+) {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (desired_rows, max_height);
+        text_edit(ui, id_source, value, InputKind::Text, ui.available_width());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        // 复用同一 id：滚动区与 TextEdit 共用，跨帧保持滚动位置与光标。
+        let base_id = ui.make_persistent_id(&id_source);
+        egui::ScrollArea::vertical()
+            .id_salt(base_id.with("scroll"))
+            .max_height(max_height)
+            // 横向占满可用宽度，纵向收缩到内容（但不超过 max_height）。
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(value)
+                        .id(base_id)
+                        .desired_rows(desired_rows)
+                        .desired_width(ui.available_width())
+                        .hint_text("每行 纬度,经度；也可粘贴 GPX / GeoJSON"),
+                );
+            });
+    }
+}
+
 pub fn text_edit(
     ui: &mut egui::Ui,
     id_source: impl Hash,

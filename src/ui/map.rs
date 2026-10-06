@@ -79,26 +79,34 @@ impl MapState {
     /// 处理拖拽/缩放交互（需在分配好 rect 后调用）。
     pub fn interact(&mut self, ui: &egui::Ui, rect: Rect) {
         self.dragged = false;
-        let (drag, scroll) = ui.input(|i| {
+        let (drag, scroll, hovered) = ui.input(|i| {
+            // interact_pos 会考虑图层遮挡：指针位于文本框等上层控件时返回其位置，
+            // 此时 rect.contains 为假，滚轮不会误触发地图缩放。
             let hover = i
                 .pointer
                 .interact_pos()
                 .map(|p| rect.contains(p))
                 .unwrap_or(false);
             let dragging = hover && i.pointer.primary_down() && i.pointer.is_decidedly_dragging();
-            (dragging, i.raw_scroll_delta.y)
+            (dragging, i.raw_scroll_delta.y, hover)
         });
         if drag {
             let d = ui.input(|i| i.pointer.delta());
             self.offset += d;
             self.dragged = true;
         }
-        if scroll != 0.0 {
-            let factor = (scroll * 0.0015).exp() as f32;
+        // 仅在指针悬停于画布内时缩放，避免在经纬度等输入框滚动时连带缩放地图。
+        if scroll != 0.0 && hovered {
+            let factor = (scroll * 0.0015).exp();
             self.scale = (self.scale * factor).clamp(0.002, 200.0);
         }
     }
 
+    /// 绘制折线。
+    ///
+    /// 屏幕空间抽稀：路径按米级间隔采样（可达上万点），缩小后相邻点会落在同一
+    /// 像素附近，逐段描边的抗锯齿会产生细缝，视觉上「断断续续」。这里丢弃屏幕
+    /// 距离 < `MIN_SEG_PX` 的相邻点（末点始终保留），既消除缝隙又减少顶点开销。
     pub fn draw_polyline(
         &self,
         painter: &egui::Painter,
@@ -110,10 +118,34 @@ impl MapState {
         if pts.len() < 2 {
             return;
         }
-        let ps: Vec<Pos2> = pts
-            .iter()
-            .map(|(la, lo)| self.to_screen(rect, *la, *lo))
-            .collect();
+        /// 相邻屏幕点的最小间距（像素）；小于该值的点会产生描边缝隙。
+        const MIN_SEG_PX: f32 = 0.75;
+
+        let mut ps: Vec<Pos2> = Vec::with_capacity(pts.len());
+        for (la, lo) in pts {
+            let p = self.to_screen(rect, *la, *lo);
+            if let Some(last) = ps.last() {
+                if (p - *last).length() < MIN_SEG_PX {
+                    continue;
+                }
+            }
+            ps.push(p);
+        }
+        // 强制保留真实末点（抽稀可能把末点视作过近而丢弃，导致终点缺失）。
+        if let Some(&(la, lo)) = pts.last() {
+            let last = self.to_screen(rect, la, lo);
+            match ps.last() {
+                Some(q) if (*q - last).length() < MIN_SEG_PX => {
+                    if let Some(slot) = ps.last_mut() {
+                        *slot = last;
+                    }
+                }
+                _ => ps.push(last),
+            }
+        }
+        if ps.len() < 2 {
+            return;
+        }
         painter.add(egui::Shape::line(ps, Stroke::new(width, color)));
     }
 

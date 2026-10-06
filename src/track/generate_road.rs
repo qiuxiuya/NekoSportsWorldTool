@@ -1,7 +1,7 @@
-//! 真实道路路由轨迹生成器（模式 B）。
+//! 真实道路路由 / 自定义路径轨迹生成器（模式 B / 模式 C）。
 //!
 //! 与经典模式（`generator::build`）的分工：
-//! - 几何源为路网闭环路线（而非 Catmull-Rom 环）；
+//! - 几何源为路网闭环路线（模式 B）或用户自定义折线（模式 C，可导入 GPX/GeoJSON/文本）；
 //! - 配速为运动学速度剖面：OU 均值回归 + 弯道预判刹车（`kinematics::pace_profile`）；
 //! - 步频/步幅为生物力学 OU 耦合（`biomech::ou_cadence_series` + `gait`）；
 //! - GPS 抖动为 AR(1) 相关漂移 + 高斯测量噪声 + 建筑 SDF 衰减（`noise::GpsJitter`）。
@@ -10,32 +10,117 @@
 
 use super::generator::{SPEED_CEIL, SPEED_FLOOR};
 use super::geom::{
-    fmt_gain_time, ring_point_at, round_to, to_bd, wgs84_to_bd09, Rng, MET_PER_DEG_LAT,
+    fmt_gain_time, path_point_at, round_to, to_bd, wgs84_to_bd09, Rng, MET_PER_DEG_LAT,
     MET_PER_DEG_LNG,
 };
 use super::model::{GenPoint, Segment, TenWindow, Track};
 use super::postfix::apply_post_fixes;
 use route_planner::{
     fatigue_from_km, gait, ou_cadence_series, pace_profile, plan_route_split, point_in_polygon,
-    Coord, GpsJitter, KinParams, RoadGraph, Route, RouteOptions, Sdf,
+    CloseMode, Coord, GpsJitter, JitterParams, KinParams, RoadGraph, Route, RouteOptions, Sdf,
 };
 
-/// 路线算法模式（二选一）。
+/// 到最近配置路径点（BD 系）的平面距离（米），用于漂移软回拉。
+fn nearest_anchor_dist(pts: &[(f64, f64)], c_lat: f64, c_lng: f64, x: f64, y: f64) -> f64 {
+    let mut best = f64::INFINITY;
+    for &(la, lo) in pts {
+        let dx = (lo - c_lng) * MET_PER_DEG_LNG - x;
+        let dy = (la - c_lat) * MET_PER_DEG_LAT - y;
+        let d = (dx * dx + dy * dy).sqrt();
+        if d < best {
+            best = d;
+        }
+    }
+    best
+}
+
+/// 路线算法模式（四选一）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum RouteMode {
     /// 经典打卡点环（Catmull-Rom）。
     #[default]
     Legacy,
-    /// 真实道路拓扑路由。
+    /// 真实道路拓扑路由（OSM）。
     Road,
+    /// 自定义路径（导入 GPX/GeoJSON/文本或手动输入经纬度）。
+    Custom,
+    /// 高德步行路径规划（按路径点沿真实道路计算）。
+    Amap,
 }
 
 impl RouteMode {
     pub fn from_str(s: &str) -> Self {
         match s {
             "road" => RouteMode::Road,
+            "custom" => RouteMode::Custom,
+            "amap" => RouteMode::Amap,
             _ => RouteMode::Legacy,
         }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RouteMode::Road => "road",
+            RouteMode::Custom => "custom",
+            RouteMode::Amap => "amap",
+            RouteMode::Legacy => "legacy",
+        }
+    }
+
+    /// 是否为「按给定折线走」的模式（自定义 / 高德），二者几何源均为折线。
+    pub fn is_polyline_based(self) -> bool {
+        matches!(self, RouteMode::Custom | RouteMode::Amap)
+    }
+}
+
+/// 首尾走法（自定义 / 高德共用），与 `route_planner::CloseMode` 一一对应。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PathClose {
+    /// 首尾相连成环。
+    #[default]
+    Closed,
+    /// 原路返回（往返）。
+    RoundTrip,
+    /// 单程（不回起点）。
+    OneWay,
+}
+
+impl PathClose {
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "roundtrip" | "round-trip" | "return" | "往返" => PathClose::RoundTrip,
+            "oneway" | "one-way" | "single" | "单程" => PathClose::OneWay,
+            _ => PathClose::Closed,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PathClose::Closed => "closed",
+            PathClose::RoundTrip => "roundtrip",
+            PathClose::OneWay => "oneway",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PathClose::Closed => "循环（首尾相连）",
+            PathClose::RoundTrip => "往返（原路返回）",
+            PathClose::OneWay => "单程（不回起点）",
+        }
+    }
+
+    pub fn to_planner(self) -> CloseMode {
+        match self {
+            PathClose::Closed => CloseMode::Closed,
+            PathClose::RoundTrip => CloseMode::RoundTrip,
+            PathClose::OneWay => CloseMode::OneWay,
+        }
+    }
+
+    /// 是否回到起点。
+    pub fn is_closed(self) -> bool {
+        self.to_planner().is_closed()
     }
 }
 
@@ -49,6 +134,7 @@ pub fn load_network_path(path: &str) -> Result<RoadGraph, String> {
 pub struct RoadPlan {
     pub route: Vec<(f64, f64)>,
     pub length_m: f64,
+    /// 路网边（BD 系折线）；自定义路径模式为空。
     pub edges: Vec<Vec<(f64, f64)>>,
     pub buildings: Vec<Vec<(f64, f64)>>,
     pub checkpoints: Vec<(f64, f64)>,
@@ -129,6 +215,36 @@ pub fn plan_road_view(
     })
 }
 
+/// 自定义 / 高德路径预览：按折线走法拼接 + 平滑，产出与路网模式一致的 RoadPlan。
+///
+/// `buildings_bd` 可为空（无建筑时 GPS 抖动不做 SDF 放大），仅用于叠加显示。
+pub fn plan_custom_view(
+    custom_bd: &[(f64, f64)],
+    close: PathClose,
+    buildings_bd: &[Vec<(f64, f64)>],
+) -> Result<RoadPlan, String> {
+    if custom_bd.len() < 2 {
+        return Err("路径至少需要 2 个点".into());
+    }
+    let coords: Vec<Coord> = custom_bd.iter().map(|p| Coord::new(p.1, p.0)).collect();
+    let route = route_planner::plan_route_polyline(
+        &coords,
+        close.to_planner(),
+        CUSTOM_FILLET_RADIUS_M,
+        CUSTOM_FILLET_THRESHOLD_DEG,
+        1.0,
+    )?;
+    let route_pts: Vec<(f64, f64)> = route.points.iter().map(|p| (p.lat, p.lon)).collect();
+    Ok(RoadPlan {
+        route: route_pts,
+        length_m: route.length_m,
+        edges: Vec::new(),
+        buildings: buildings_bd.to_vec(),
+        checkpoints: custom_bd.to_vec(),
+        fences: Vec::new(),
+    })
+}
+
 /// 将 WGS84 路网逐节点转换为 BD-09（与打卡点同系）。
 ///
 /// OSM 为 WGS84，打卡点为 BD-09。两者不是常数平移关系（境内 GCJ/BD 偏移随位置
@@ -154,6 +270,30 @@ pub fn align_network(net: &mut RoadGraph) {
     net.rebuild_index();
 }
 
+/// 加载 OSM 路网并转成 BD 系的建筑轮廓（自定义路径模式下的 SDF 用）。
+///
+/// 失败（未配置 / 读取失败 / 解析失败）时返回空列表，不阻断轨迹生成。
+pub fn load_buildings_bd(path: &str) -> Vec<Vec<(f64, f64)>> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    match route_planner::load_osm(&bytes) {
+        Ok(net) => net
+            .buildings
+            .iter()
+            .map(|ring| {
+                ring.iter()
+                    .map(|c| wgs84_to_bd09(c.lat, c.lon))
+                    .collect::<Vec<_>>()
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// 按质心角度排序打卡点，形成自然环序。
 pub fn radial_order(points_bd: &[(f64, f64)]) -> Vec<(f64, f64)> {
     let n = points_bd.len();
@@ -173,6 +313,11 @@ pub fn radial_order(points_bd: &[(f64, f64)]) -> Vec<(f64, f64)> {
     });
     ordered
 }
+
+/// 自定义折线转角切角半径（米）：用户给的折线多为几十米级航点，20m 足够圆滑。
+pub const CUSTOM_FILLET_RADIUS_M: f64 = 20.0;
+/// 自定义折线切角阈值（度）：小于该角度的转折不切，保持直线。
+pub const CUSTOM_FILLET_THRESHOLD_DEG: f64 = 30.0;
 
 /// 路线 → 平面折线 + 弧长表。
 ///
@@ -197,6 +342,7 @@ fn route_ring(route: &Route, c_lat: f64, c_lng: f64) -> (Vec<(f64, f64)>, Vec<f6
 ///
 /// `route_bd[0]` 为起点，`route_bd[1..]` 为软引导点（用于方向锚点，不必全经过）；
 /// `must_bd` 为强制必经点（按序，可为空，最终必达）；吸附在 `route_bd` 全量上做。
+#[allow(clippy::too_many_arguments)]
 pub fn build_road(
     dist: f64,
     dur: i64,
@@ -205,10 +351,9 @@ pub fn build_road(
     route_bd: &[(f64, f64)],
     must_bd: &[(f64, f64)],
     net: &RoadGraph,
+    drift_m: f64,
 ) -> Result<Track, String> {
-    let mut rng = Rng::new(seed);
-    let dur_f = dur as f64;
-    let avg_v = dist / dur_f;
+    let avg_v = dist / dur as f64;
     let a_c_max = 2.5;
     let radius = (avg_v * avg_v / a_c_max).max(6.0);
     let opts = RouteOptions {
@@ -222,11 +367,87 @@ pub fn build_road(
     let route = plan_route_split(net, &waypoints, &must, dist, seed, &opts)?;
 
     let n_pts = route_bd.len().max(1);
-    let (c_lat, c_lng) = (
+    let center_bd = (
         route_bd.iter().map(|q| q.0).sum::<f64>() / n_pts as f64,
         route_bd.iter().map(|q| q.1).sum::<f64>() / n_pts as f64,
     );
-    let (dense, arcs) = route_ring(&route, c_lat, c_lng);
+    let buildings: Vec<Vec<(f64, f64)>> = net
+        .buildings
+        .iter()
+        .map(|r| r.iter().map(|c| (c.lat, c.lon)).collect())
+        .collect();
+    render_route_track(
+        &route, &buildings, center_bd, dist, dur, seed, start_ms, route_bd, true, drift_m,
+    )
+}
+
+/// 模式 C / D：按用户给定（或高德返回）折线生成轨迹（走法拼接 + 转弯切角 + 运动学剖面）。
+///
+/// `custom_bd` 按用户给定顺序采样（不做最短路径重排）；`close` 决定首尾走法；
+/// `buildings_bd` 用于 GPS 抖动 SDF 放大，可为空。
+#[allow(clippy::too_many_arguments)]
+pub fn build_custom(
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    start_ms: i64,
+    custom_bd: &[(f64, f64)],
+    close: PathClose,
+    buildings_bd: &[Vec<(f64, f64)>],
+    drift_m: f64,
+) -> Result<Track, String> {
+    if custom_bd.len() < 2 {
+        return Err("路径至少需要 2 个点".into());
+    }
+    let avg_v = dist / dur as f64;
+    let a_c_max = 2.5;
+    let radius = (avg_v * avg_v / a_c_max).max(6.0);
+    let coords: Vec<Coord> = custom_bd.iter().map(|p| Coord::new(p.1, p.0)).collect();
+    let route =
+        route_planner::plan_route_polyline(&coords, close.to_planner(), radius, 30.0, 1.0)?;
+    let n = custom_bd.len() as f64;
+    let center_bd = (
+        custom_bd.iter().map(|q| q.0).sum::<f64>() / n,
+        custom_bd.iter().map(|q| q.1).sum::<f64>() / n,
+    );
+    render_route_track(
+        &route,
+        buildings_bd,
+        center_bd,
+        dist,
+        dur,
+        seed,
+        start_ms,
+        custom_bd,
+        close.is_closed(),
+        drift_m,
+    )
+}
+
+/// 由已规划路线渲染完整协议轨迹（模式 B / C / D 共用）。
+///
+/// `anchor_points` 为吸附目标（<40m 精确落位），通常即用户给定/打卡点坐标。
+/// `closed` 为真时按环线取模取点（回到起点），为假时按开放折线取点（单程、终点收尾）。
+#[allow(clippy::too_many_arguments)]
+fn render_route_track(
+    route: &Route,
+    buildings_bd: &[Vec<(f64, f64)>],
+    center_bd: (f64, f64),
+    dist: f64,
+    dur: i64,
+    seed: u64,
+    start_ms: i64,
+    anchor_points: &[(f64, f64)],
+    closed: bool,
+    drift_m: f64,
+) -> Result<Track, String> {
+    let mut rng = Rng::new(seed);
+    let dur_f = dur as f64;
+    let avg_v = dist / dur_f;
+    let a_c_max = 2.5;
+
+    let (c_lat, c_lng) = center_bd;
+    let (dense, arcs) = route_ring(route, c_lat, c_lng);
 
     // 时间网格（同经典模式）
     let mut times = Vec::new();
@@ -250,7 +471,7 @@ pub fn build_road(
     };
     let speed_seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let w = pace_profile(
-        &route,
+        route,
         avg_v,
         &dts,
         dist,
@@ -303,8 +524,12 @@ pub fn build_road(
     }
 
     // 建筑 SDF（自适应放大漂移）
+    let bld_coords: Vec<Vec<Coord>> = buildings_bd
+        .iter()
+        .map(|r| r.iter().map(|&(la, lo)| Coord::new(lo, la)).collect())
+        .collect();
     let sdf = Sdf::from_buildings(
-        &net.buildings,
+        &bld_coords,
         |c| {
             [
                 (c.lon - c_lng) * MET_PER_DEG_LNG,
@@ -325,8 +550,8 @@ pub fn build_road(
     let cadence_seed = seed.wrapping_add(0xC6A4_A793_5BD1_E995);
     let cadences = ou_cadence_series(&targets, &dts, cadence_seed, 0.25, 0.5, 110.0, 220.0);
 
-    // GPS 抖动：AR(1) 相关漂移 + 高斯测量噪声（SDF 逐点放大）
-    let mut jitter = GpsJitter::new(0.72, 0.75, 0.3);
+    // GPS 抖动：AR(1) 走廊各向异性 + 锚点软回拉（范围由 drift_m 决定，SDF 逐点放大）
+    let mut jitter = GpsJitter::with_params(JitterParams::from_drift_m(drift_m));
 
     let mut locs: Vec<GenPoint> = Vec::with_capacity(n);
     let mut s = 0.0f64;
@@ -346,7 +571,7 @@ pub fn build_road(
         let dt = dts[i];
         let (typ, lt) = kinds[i];
         t_acc += dt;
-        let pos = |ss: f64| ring_point_at(&dense, &arcs, ss);
+        let pos = |ss: f64| path_point_at(&dense, &arcs, ss, closed);
         let mut d_step = 0.0f64;
         let px;
         let py;
@@ -360,15 +585,18 @@ pub fn build_road(
             let (bx, by) = pos(s);
             x = bx;
             y = by;
-            // AR(1) 相关漂移 + 高斯测量噪声，SDF 自适应放大
+            // AR(1) 走廊各向异性 + 锚点软回拉，SDF 自适应放大
             let sc = sdf.sigma_scale([bx, by]);
+            let (tx, ty) = pos(s + 2.0);
+            let tangent = Some([tx - bx, ty - by]);
+            let near = nearest_anchor_dist(anchor_points, c_lat, c_lng, bx, by);
             let z = [
                 rng.gauss(0.0, 1.0),
                 rng.gauss(0.0, 1.0),
                 rng.gauss(0.0, 1.0),
                 rng.gauss(0.0, 1.0),
             ];
-            let (jxd, jyd) = jitter.step(sc, z);
+            let (jxd, jyd) = jitter.step(sc, tangent, near, z);
             px = bx + jxd;
             py = by + jyd;
             rad = round_to(
@@ -579,8 +807,8 @@ pub fn build_road(
 
     apply_post_fixes(&mut locs, &mut rng, start_ms);
 
-    // 点位吸附：<40m 精确落位（全量打卡点，含必经点与普通打卡点）
-    for pl in route_bd {
+    // 点位吸附：<40m 精确落位（全量目标点，含必经点与普通打卡点 / 自定义路径点）
+    for pl in anchor_points {
         let mut best_i = None;
         let mut best_d = 1e18f64;
         for (i, q) in locs.iter().enumerate() {
@@ -593,8 +821,12 @@ pub fn build_road(
         }
         if let Some(i) = best_i {
             if best_d < 40.0 * 40.0 {
+                // 吸附前记录与漂移轨迹的残差，吸附后同步抖动状态，避免下一点弹跳
+                let rx = (locs[i].gLng - pl.1) * MET_PER_DEG_LNG;
+                let ry = (locs[i].gLat - pl.0) * MET_PER_DEG_LAT;
                 locs[i].gLat = round_to(pl.0, 7);
                 locs[i].gLng = round_to(pl.1, 7);
+                jitter.resync((rx, ry));
             }
         }
     }

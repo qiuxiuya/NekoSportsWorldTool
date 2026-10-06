@@ -113,6 +113,32 @@ pub fn make_point_ring(bd_points: &[(f64, f64)]) -> PointRing {
 pub fn ring_point_at(dense: &[(f64, f64)], arcs: &[f64], s: f64) -> (f64, f64) {
     let total = *arcs.last().unwrap_or(&1.0);
     let s = s.rem_euclid(total);
+    interpolate_at(dense, arcs, s)
+}
+
+/// 折线弧长 → 坐标。
+///
+/// - `closed`：按总长取模，绕圈重复（适合闭环 / 往返折线）。
+/// - 开放（单程）：以三角波在 [0,total] 内折返，避免目标距离超过路径长度时
+///   大量采样点堆积在终点（GPS 长时间不动的异常观感）。
+pub fn path_point_at(dense: &[(f64, f64)], arcs: &[f64], s: f64, closed: bool) -> (f64, f64) {
+    let total = *arcs.last().unwrap_or(&1.0);
+    let s = if closed || total <= 0.0 {
+        s.rem_euclid(total.max(1e-9))
+    } else {
+        let period = total * 2.0;
+        let x = s.rem_euclid(period);
+        if x <= total {
+            x
+        } else {
+            period - x
+        }
+    };
+    interpolate_at(dense, arcs, s)
+}
+
+/// 弧长 s（已归一到 [0,total]）→ 坐标（二分定位 + 线性插值）。
+fn interpolate_at(dense: &[(f64, f64)], arcs: &[f64], s: f64) -> (f64, f64) {
     let mut lo = 0usize;
     let mut hi = arcs.len();
     while lo < hi {
@@ -123,7 +149,7 @@ pub fn ring_point_at(dense: &[(f64, f64)], arcs: &[f64], s: f64) -> (f64, f64) {
             hi = mid;
         }
     }
-    let i = lo.max(1);
+    let i = lo.max(1).min(dense.len().saturating_sub(1).max(1));
     let a = dense[(i - 1) % dense.len()];
     let b = dense[i % dense.len()];
     let seg = arcs[i] - arcs[i - 1];

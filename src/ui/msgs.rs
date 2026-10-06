@@ -109,6 +109,24 @@ impl App {
         }
         if done_points {
             self.run_page.preview_stale = true;
+            // 高德模式：检查点到位后自动填充路径点（仅在有缓存时，避免拉取失败造成循环）。
+            if self.run_page.route_mode == crate::track::generate_road::RouteMode::Amap
+                && self.run_page.custom_points_bd.is_none()
+            {
+                let has = self
+                    .identity
+                    .anchor_coordinate()
+                    .ok()
+                    .and_then(model::load_points_cache_for)
+                    .map(|(_t, p)| crate::api::points::points_bd(&p).len() >= 2)
+                    .unwrap_or(false);
+                if has && self.amap_fill_from_checkpoints() {
+                    // 检查点到位即自动触发一次沿路规划（Key 已配置时）。
+                    if !self.run_page.amap_key.trim().is_empty() && !self.run_page.amap_busy {
+                        self.run_page.amap_plan_requested = true;
+                    }
+                }
+            }
         }
         if let Some(v) = done_login {
             self.login_busy = false;
