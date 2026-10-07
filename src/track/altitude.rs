@@ -7,7 +7,30 @@
 #![allow(non_snake_case)]
 
 use super::geom::round_to;
-use super::model::Track;
+use super::model::{GenPoint, Track};
+
+/// Elevation changes at or below this size are treated as sensor/GPS noise.
+pub const ASCENT_NOISE_THRESHOLD_M: f64 = 0.15;
+
+/// 海拔以两位小数存储，相邻差值（如 10.15 - 10.0）会因浮点表示误差
+/// 略大于 0.15，这里用 1e-9 容差保证"严格大于 0.15 才计入"的十进制语义。
+pub fn positive_ascent_delta(delta_m: f64) -> f64 {
+    if delta_m - ASCENT_NOISE_THRESHOLD_M > 1e-9 {
+        delta_m
+    } else {
+        0.0
+    }
+}
+
+/// Sum positive elevation changes while ignoring small sensor fluctuations.
+pub fn total_ascent(locs: &[GenPoint]) -> f64 {
+    round_to(
+        locs.windows(2)
+            .map(|pair| positive_ascent_delta(pair[1].bdA - pair[0].bdA))
+            .sum(),
+        2,
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AltitudeRange {
@@ -185,5 +208,29 @@ mod tests {
         let mut track = build(1200.0, 600, 7, (38.9, 121.54), 1_700_000_000_000, &points(), DRIFT_M);
         override_bd_a_range(&mut track, AltitudeRange { min_m: 11.6, max_m: 22.8 }).unwrap();
         assert!(track.locations.iter().all(|p| (11.6..=22.8).contains(&p.bdA)));
+        let (ascent, descent, net) = track.elevation_stats();
+        // 噪声过滤下 ascent - descent 不必等于 net，但各项必须有限、非负，
+        // 且 net 恒等于末点海拔减首点海拔。
+        assert!(ascent.is_finite() && ascent >= 0.0);
+        assert!(descent.is_finite() && descent >= 0.0);
+        let first = track.locations.first().map(|p| p.bdA).unwrap_or(0.0);
+        let last = track.locations.last().map(|p| p.bdA).unwrap_or(0.0);
+        assert!((net - (last - first)).abs() < 0.05);
+    }
+
+    /// 相邻海拔增量必须严格大于 0.15m 才计入爬升（Issue #38）。
+    #[test]
+    fn ascent_ignores_small_fluctuations_and_rounds() {
+        let mut track = build(1000.0, 500, 1, (38.9, 121.54), 1_700_000_000_000, &points(), DRIFT_M);
+        let mut locations = track.locations[..4].to_vec();
+        for (point, altitude) in locations.iter_mut().zip([10.0, 10.14, 10.29, 10.45]) {
+            point.bdA = altitude;
+        }
+        track.locations = locations;
+        // +0.14 / +0.15 均被忽略，仅 +0.16 计入。
+        assert_eq!(total_ascent(&track.locations), 0.16);
+        // 恰好 0.15 属于噪声，不计入。
+        track.locations[1].bdA = 10.15;
+        assert_eq!(total_ascent(&track.locations), 0.16);
     }
 }

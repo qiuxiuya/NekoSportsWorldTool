@@ -89,6 +89,28 @@ impl Track {
         for point in &self.locations { Coordinate::new(point.gLat, point.gLng, point.accuracy)?; }
         self.start_coordinate()
     }
+
+    /// 累计爬升/下降与净海拔变化（与提交体、每圈数据共用同一噪声阈值）。
+    pub fn elevation_stats(&self) -> (f64, f64, f64) {
+        let mut ascent = 0.0;
+        let mut descent = 0.0;
+        for pair in self.locations.windows(2) {
+            let delta = pair[1].bdA - pair[0].bdA;
+            let ascent_delta = super::altitude::positive_ascent_delta(delta);
+            if delta > 0.0 {
+                ascent += ascent_delta;
+            } else if delta < 0.0 {
+                descent += -delta;
+            }
+        }
+        let net = self.locations.last().map(|p| p.bdA).unwrap_or(0.0)
+            - self.locations.first().map(|p| p.bdA).unwrap_or(0.0);
+        (
+            super::geom::round_to(ascent, 2),
+            super::geom::round_to(descent, 2),
+            super::geom::round_to(net, 2),
+        )
+    }
 }
 
 #[cfg(test)]

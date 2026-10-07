@@ -348,6 +348,15 @@ pub fn run_full_flow(
             .map(|t| t.format("%H:%M:%S").to_string())
             .unwrap_or_default(),
     ));
+    let (ascent, descent, net) = track.elevation_stats();
+    log(&format!(
+        "[track] 海拔统计：起点 {:.2}m，终点 {:.2}m，累计爬升 {:.2}m，累计下降 {:.2}m，净变化 {:.2}m",
+        track.locations.first().map(|point| point.bdA).unwrap_or(0.0),
+        track.locations.last().map(|point| point.bdA).unwrap_or(0.0),
+        ascent,
+        descent,
+        net,
+    ));
 
     // ④ 五点 wrapper（跑完态）
     let five = five_point_wrapper(&pts, track.startTime);

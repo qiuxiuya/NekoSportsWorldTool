@@ -192,17 +192,20 @@ fn build_windows(track: &Track, rrid: i64) -> (Vec<Value>, Vec<Value>) {
     (sp, stf)
 }
 
-/// 圈（每 1000m 一圈，末圈 isFullLap=false；avgStride 单位厘米）。
+/// 圈（每 1000m 一圈，末圈 isFullLap=false；avgPace 单位秒/公里，avgStride 单位米）。
 fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
     let mut laps = Vec::new();
     let locs = &track.locations;
-    let (mut prev_d, mut prev_t, mut prev_steps, mut gain) = (0.0f64, 0i64, 0i64, 0.0f64);
+    let (mut prev_d, mut prev_t, mut prev_steps, mut gain, mut loss) =
+        (0.0f64, 0i64, 0i64, 0.0f64, 0.0f64);
     let alt0 = locs.first().map(|p| p.bdA).unwrap_or(0.0);
     for (i, pt) in locs.iter().enumerate() {
         if i > 0 {
             let dd = pt.bdA - locs[i - 1].bdA;
             if dd > 0.0 {
-                gain += dd;
+                gain += crate::track::altitude::positive_ascent_delta(dd);
+            } else {
+                loss += -dd;
             }
         }
         let d_now = pt.totalDis;
@@ -214,12 +217,13 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
             let lap_steps = pt.steps - prev_steps;
             laps.push(json!({
                 "avgCadence": round_to(lap_steps as f64 / (lap_t as f64 / 60.0), 2),
-                "avgPace": round_to((lap_t as f64 / 60.0) / (lap_d / 1000.0).max(0.001), 2),
-                "avgStride": round_to(lap_d / 1.max(lap_steps) as f64 * 100.0, 2),
+                "avgPace": round_to(lap_t as f64 / (lap_d / 1000.0).max(0.001), 2),
+                "avgStride": round_to(lap_d / 1.max(lap_steps) as f64, 2),
                 "cumulativeDuration": t_now,
                 "distance": round_to(lap_d, 4),
                 "duration": lap_t,
                 "elevationGain": round_to(gain, 2),
+                "elevationLoss": round_to(loss, 2),
                 "endAltAbs": round_to(pt.bdA, 2),
                 "endAltRel": round_to(pt.bdA - alt0, 2),
                 "flag": start_ms,
@@ -232,6 +236,7 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
             prev_t = t_now;
             prev_steps = pt.steps;
             gain = 0.0;
+            loss = 0.0;
         }
     }
     laps

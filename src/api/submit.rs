@@ -64,16 +64,39 @@ fn android_tensec(track: &Track, start_ms: i64, kind: &str) -> Vec<Value> {
     out
 }
 
-/// bdA 正差分累计。
+/// bdA 正差分累计，忽略不超过 0.15m 的传感器噪声（与每圈数据共用同一算法）。
 pub fn total_ascent(locs: &[GenPoint]) -> f64 {
-    let mut ascent = 0.0;
-    for i in 1..locs.len() {
-        let d = locs[i].bdA - locs[i - 1].bdA;
-        if d > 0.0 {
-            ascent += d;
-        }
+    crate::track::altitude::total_ascent(locs)
+}
+
+/// 累计下降：负差分的绝对值求和。
+#[allow(dead_code)]
+pub fn total_descent(locs: &[GenPoint]) -> f64 {
+    locs.windows(2)
+        .map(|pair| (pair[0].bdA - pair[1].bdA).max(0.0))
+        .sum()
+}
+
+/// 净海拔变化：终点海拔减起点海拔。
+#[allow(dead_code)]
+pub fn net_elevation_change(locs: &[GenPoint]) -> f64 {
+    match (locs.first(), locs.last()) {
+        (Some(first), Some(last)) => last.bdA - first.bdA,
+        _ => 0.0,
     }
-    ascent
+}
+
+fn average_step_frequency(total_steps: i64, total_time: i64) -> i64 {
+    (total_steps as f64 / total_time as f64 * 60.0).round() as i64
+}
+
+/// 服务端配速单位：千分之一分钟/公里（毫配速），不再乘 1024。
+pub fn pace_speed_value(total_time_s: i64, distance_m: f64) -> i64 {
+    let distance_m = (distance_m * 100.0).ceil() / 100.0;
+    if distance_m <= 0.0 {
+        return 0;
+    }
+    (total_time_s as f64 / distance_m * 50.0 / 3.0 * 1000.0).round() as i64
 }
 
 pub struct SubmitParams {
@@ -122,9 +145,8 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
     let run_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
     let unid = p.selected_unid;
 
-    let dis_ceil = (total_dis * 100.0).ceil() / 100.0;
-    let speed = (round_to(total_time as f64 / dis_ceil * 50.0 / 3.0, 2) * 1024.0) as i64;
-    let avg_step_freq = 1i64.max(round_to(total_steps as f64 / total_time as f64 * 60.0, 0) as i64);
+    let speed = pace_speed_value(total_time, total_dis);
+    let avg_step_freq = 1i64.max(average_step_frequency(total_steps, total_time));
 
     let mut body = Map::new();
     body.insert("allLocJson".into(), Value::String(String::new()));
@@ -151,7 +173,7 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
     body.insert("avgStepFreq".into(), Value::from(avg_step_freq));
     body.insert("useMobilityTools".into(), Value::from(0));
     body.insert("faceCheck".into(), Value::from(p.face_check));
-    body.insert("totalAscent".into(), Value::from(round_to(ascent, 0) as i64));
+    body.insert("totalAscent".into(), Value::from(round_to(ascent, 2)));
     body.insert("avgPower".into(), Value::from(power));
     body.insert("speedPerTenSec".into(), Value::Array(android_tensec(track, start_ms, "speed")));
     body.insert("stepsPerTenSec".into(), Value::Array(android_tensec(track, start_ms, "steps")));
@@ -247,4 +269,67 @@ fn client_token(client: &ApiClient) -> String {
 fn truncate_json(v: &Value) -> String {
     let s = v.to_string();
     s.chars().take(240).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        average_step_frequency, net_elevation_change, pace_speed_value, total_ascent,
+        total_descent,
+    };
+
+    fn sample_track() -> crate::track::model::Track {
+        crate::track::generator::build(
+            1000.0,
+            374,
+            42,
+            (38.9, 121.54),
+            1_788_958_186_123,
+            &[
+                (38.901678, 121.540241),
+                (38.902564, 121.541233),
+                (38.900921, 121.542310),
+                (38.899823, 121.541010),
+                (38.900455, 121.539512),
+            ],
+            1.5,
+        )
+    }
+
+    #[test]
+    fn average_step_frequency_uses_rounded_total_steps_over_actual_time() {
+        assert_eq!(
+            average_step_frequency(773, 374),
+            (773.0f64 / 374.0 * 60.0).round() as i64
+        );
+        assert_eq!(average_step_frequency(7, 8), 53);
+    }
+
+    #[test]
+    fn elevation_stats_use_positive_and_negative_deltas() {
+        let mut track = sample_track();
+        let mut points = Vec::new();
+        for (i, altitude) in [10.0, 15.0, 12.0, 18.0].iter().copied().enumerate() {
+            let mut point = track.locations[0].clone();
+            point.totalTime = i as i64 + 1;
+            point.bdA = altitude;
+            points.push(point);
+        }
+        track.locations = points;
+        // 爬升仅计 +5 与 +6（+0.15 噪声阈值不影响该样本），下降计 -3。
+        assert!((total_ascent(&track.locations) - 11.0).abs() < 1e-9);
+        assert!((total_descent(&track.locations) - 3.0).abs() < 1e-9);
+        assert!(
+            (net_elevation_change(&track.locations)
+                - (track.locations.last().unwrap().bdA - track.locations.first().unwrap().bdA))
+                .abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn pace_uses_thousandths_of_minute_per_kilometre() {
+        assert_eq!(pace_speed_value(2295, 5030.0), 7604);
+        assert!((pace_speed_value(2295, 5030.0) as f64 / 1000.0 - 7.604).abs() < 0.001);
+    }
 }
