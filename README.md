@@ -37,12 +37,15 @@
 ```text
 NekoSportsWorldTool login --user <手机号> --pass <密码> --remember
 NekoSportsWorldTool run                                  # 一键跑步（--altitude 17.2 固定海拔，或 11.6-22.8 映射到区间）
+NekoSportsWorldTool runjob --file job.json               # 用一个 JSON 装下账号+设备+定位+跑步全部配置，跑完即退出
 NekoSportsWorldTool ai --sport 2 --score 26000           # AI 运动
 NekoSportsWorldTool rank main --type 1 --sort 1          # 排行榜
 NekoSportsWorldTool update [--check]           # 自动更新（--check 仅检查不下载）
 NekoSportsWorldTool template --file run.gpx   # 本地分析真实记录海拔（不会上传）
 NekoSportsWorldTool help                                 # 全部命令
 ```
+
+`runjob` 的 JSON 配置字段详见 [docs/runjob.md](docs/runjob.md)，完整示例见 [runjob.example.json](runjob.example.json)。
 
 `template` 只读取用户手动选择的本地 GPX/JSON 文件，输出采样点、海拔范围、累计上升和累计下降，
 不会登录、访问服务器或把模板记录接入跑步上传流程。

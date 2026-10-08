@@ -12,6 +12,7 @@ pub fn dispatch(args: Vec<String>) -> i32 {
         "login" => cmd_login(&rest),
         "logout" => cmd_logout(),
         "run" => cmd_run(&rest),
+        "runjob" => super::runjob::cmd_runjob(&rest),
         "template" => cmd_template(&rest),
         "ai" => cmd_ai(&rest),
         "ai-list" => cmd_ai_list(),

@@ -1,0 +1,69 @@
+{
+  "username": "13800000000",
+  "password": "your-password",
+
+  "dist_km": null,
+  "dist_km_min": 5.0,
+  "dist_km_max": 6.0,
+
+  "pace": null,
+  "pace_min": 360,
+  "pace_max": 480,
+
+  "start": {
+    "mode": "random",
+    "ago_min": 0,
+    "days_ago": 0,
+    "time": ""
+  },
+
+  "face_check": true,
+
+  "altitude": null,
+  "altitude_min": 15.0,
+  "altitude_max": 25.0,
+
+  "gps_drift_m": 3.0,
+  "seed": 0,
+
+  "route_mode": "custom",
+  "custom_close": "closed",
+  "custom_datum": "wgs84",
+  "custom_use_buildings": true,
+
+  "custom_points": [
+    [39.912179, 119.541780],
+    [39.912265, 119.541777],
+    [39.912350, 119.541775],
+    [39.912436, 119.541772],
+    [39.912522, 119.541769],
+    [39.912607, 119.541766],
+    [39.912693, 119.541763],
+    [39.912779, 119.541760],
+    [39.912864, 119.541757]
+  ],
+  "custom_text": null,
+  "custom_file": null,
+
+  "amap_key": null,
+  "amap_jscode": null,
+
+  "device": {
+    "platform": "android",
+    "device_name": "22081212C",
+    "os_version": "14",
+    "idfa": null,
+    "manufacturer": null,
+    "device_id": null
+  },
+
+  "location": {
+    "city": "北京市",
+    "anchor_lat": 39.912865,
+    "anchor_lon": 119.541755,
+    "auto": true,
+    "offset_m": 200.0,
+    "offset_bearing": 0.0,
+    "city_auto": true
+  }
+}

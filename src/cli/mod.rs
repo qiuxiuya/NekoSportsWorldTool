@@ -5,6 +5,7 @@
 //! 即可（会话失效且已记住凭据时自动重登）。
 
 mod cmds;
+mod runjob;
 
 use crate::api::client::ApiClient;
 use crate::api::model::{self, Session};
@@ -23,6 +24,8 @@ fn usage() {
   logout                                   登出并清理本地会话
   run    [--dist km] [--pace 秒/km] [--altitude 米或min-max] [--ago 分钟] [--days-ago 0-3 --time HH:MM] [--face 0|1] [--seed n] [--route legacy|road]
                                            跑步全链：策略-点位-轨迹-提交-OBS-验证（--route 选择路线算法）
+  runjob --file <job.json>                 从 JSON 读取账号/设备/定位/跑步全部配置，自动登录跑完即退出
+                                           （JSON 字段见 src/cli/runjob.rs 顶部文档）
   template --file <GPX/JSON>                本地读取真实记录，分析海拔（不会上传）
   ai-list                                  AI 运动项目列表
   ai     --sport <id> [--mode min|count] [--score n]
