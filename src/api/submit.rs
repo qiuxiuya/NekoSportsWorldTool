@@ -12,17 +12,23 @@ use crate::crypto::sign::{original_sign, signature};
 use crate::track::calorie::{avg_power, official_kcal};
 use crate::track::geom::round_to;
 use crate::track::model::{GenPoint, Track};
-use crate::track::wire::validate_five_point_wrapper;
+use crate::track::wire::validate_five_point_body;
 use serde_json::{json, Map, Value};
 
 pub const RECORD_PATH: &str = "/api/v70260/runnings/save/record";
 
-/// Android 10s 窗（id 种子 60000）。
-fn android_tensec(track: &Track, start_ms: i64, kind: &str) -> Vec<Value> {
+/// Android 10s 窗。
+///
+/// 逆向对照（StepsPerTenSec/SpeedPerTenSec 实体 + wire::build_windows 实测向量）：
+/// id = (rrid%100000)*1000 + 窗口结束秒；queueNum 随窗序递增；
+/// minDiff 真人样本为 1000.0（步频差千分位）。
+/// 提交体官方恒为空数组；本函数保留给 UI 明细重建（record rrid 回填后）复用。
+#[allow(dead_code)]
+pub fn android_tensec(track: &Track, start_ms: i64, rrid: i64, kind: &str) -> Vec<Value> {
     let locs = &track.locations;
     let total_time = track.totalTime;
     let mut out = Vec::new();
-    let rid_seed = 60000i64;
+    let id_seed = (rrid % 100000) * 1000;
     let mut w = 10i64;
     while w <= total_time {
         let lo = w - 10;
@@ -47,15 +53,16 @@ fn android_tensec(track: &Track, start_ms: i64, kind: &str) -> Vec<Value> {
         let begin = start_ms + lo * 1000;
         let end = start_ms + hi * 1000;
         let qn = w / 10 - 1;
+        let id = id_seed + hi;
         if kind == "speed" {
             out.push(json!({
                 "beginTime": begin, "distance": dist, "endTime": end,
-                "flag": start_ms, "id": rid_seed + qn, "queueNum": qn, "state": 0,
+                "flag": start_ms, "id": id, "queueNum": qn, "state": 0,
             }));
         } else {
             out.push(json!({
                 "avgDiff": 0.0, "beginTime": begin, "endTime": end,
-                "flag": start_ms, "id": rid_seed + qn, "maxDiff": 0.0,
+                "flag": start_ms, "id": id, "maxDiff": 0.0,
                 "minDiff": 1000.0, "queueNum": qn, "state": 0, "stepsNum": steps_n,
             }));
         }
@@ -132,7 +139,7 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
     let track = &p.track;
     let start_coordinate = track.validate_consistency()?;
     if p.five_point_json.is_empty() { return Err("五点轨迹不能为空".into()); }
-    validate_five_point_wrapper(&p.five_point_json)?;
+    validate_five_point_body(&p.five_point_json)?;
     let total_time = track.totalTime;
     let total_dis = track.totalDistance;
     let total_steps = track.totalSteps;
@@ -144,6 +151,10 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
 
     let run_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
     let unid = p.selected_unid;
+    // rrid 提交前不可知：10s 窗 id 需要 rrid 派生种子，服务端以提交响应 rrid 为准
+    // 重建窗口（见提交成功后的二次组装），这里先按 0 种子占位。
+    //（提交体中 speedPerTenSec/stepsPerTenSec 官方恒为空数组，实际窗口走 OBS，
+    //  此处保留空数组与官方行为一致。）
 
     let speed = pace_speed_value(total_time, total_dis);
     let avg_step_freq = 1i64.max(average_step_frequency(total_steps, total_time));
@@ -173,10 +184,15 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
     body.insert("avgStepFreq".into(), Value::from(avg_step_freq));
     body.insert("useMobilityTools".into(), Value::from(0));
     body.insert("faceCheck".into(), Value::from(p.face_check));
-    body.insert("totalAscent".into(), Value::from(round_to(ascent, 2)));
+    // 逆向 UploadSignEntity.totalAscent 为 int：签名串 String.valueOf(int) 是整数，
+    // 浮点会让服务端按 int 截断后重算签名 → 10501 验证签名失败。
+    // 官方 setTotalAscent(int) 对 double 隐式截断（非四舍五入），此处对齐为截断。
+    body.insert("totalAscent".into(), Value::from(ascent as i64));
     body.insert("avgPower".into(), Value::from(power));
-    body.insert("speedPerTenSec".into(), Value::Array(android_tensec(track, start_ms, "speed")));
-    body.insert("stepsPerTenSec".into(), Value::Array(android_tensec(track, start_ms, "steps")));
+    // 官方 RunUploadHelper 恒 setStepsPerTenSec(空)/setSpeedPerTenSec(空)，
+    // 明细窗口仅走 OBS 通道；保留空数组避免服务端双份窗口对账不一致。
+    body.insert("speedPerTenSec".into(), Value::Array(Vec::new()));
+    body.insert("stepsPerTenSec".into(), Value::Array(Vec::new()));
     body.insert("isUpload".into(), Value::Bool(false));
     body.insert("more".into(), Value::Bool(false));
     body.insert("latitude".into(), Value::from(start_coordinate.latitude));

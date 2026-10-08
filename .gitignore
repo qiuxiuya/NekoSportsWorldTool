@@ -2,7 +2,7 @@
 Cargo.lock.bak
 nekosportsworldtool.log*
 *.log.old
-
+/dex/
 # 运行时数据（含会话/凭据，禁止入库）
 /session.json
 /config.json

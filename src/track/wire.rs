@@ -75,6 +75,11 @@ pub fn conv_point(p: &GenPoint, start_ms: i64) -> Value {
 }
 
 /// 五点实体（实时点位 → 跑完态 isPass=true）。
+///
+/// 逆向对照（FivePointPlugin / FivePoint 实体）：
+/// - position 必须是 1..5 的序号；999 是"非五点"哨兵，会被判定直接跳过；
+/// - id 用点位接口返回的真实 id（缺失则退化为 1..5）；
+/// - isFixed=1 表示顺序必经点（SEQUENTIAL 策略），随机策略为 0。
 pub fn five_point_payload(points: &[Value], start_ms: i64) -> Vec<Value> {
     points
         .iter()
@@ -84,20 +89,26 @@ pub fn five_point_payload(points: &[Value], start_ms: i64) -> Vec<Value> {
                 "flag": start_ms,
                 "glat": p["glat"].as_f64().unwrap_or(0.0),
                 "glon": p["glon"].as_f64().unwrap_or(0.0),
-                "id": i as i64 + 1,
+                "id": p["id"].as_i64().unwrap_or(i as i64 + 1),
                 "isFixed": p["isFixed"].as_i64().unwrap_or(0),
                 "isPass": true,
                 "lat": p["lat"].as_f64().unwrap_or(0.0),
                 "lon": p["lon"].as_f64().unwrap_or(0.0),
                 "pointName": p["pointName"].as_str().unwrap_or(""),
-                "position": 999,
+                "position": i as i64 + 1,
                 "state": 0,
             })
         })
         .collect()
 }
 
-/// 提交 body 的 fivePointJson 包装串。
+/// record body 的 fivePointJson：官方 UploadFormatEntity 直接放 FivePoint 数组的
+/// JSON 字符串（RunUploadHelper: `toJson(list3)`），不是 wrapper。
+pub fn five_point_body(points: &[Value], start_ms: i64) -> String {
+    Value::Array(five_point_payload(points, start_ms)).to_string()
+}
+
+/// OBS fixed_point_json 键的 wrapper（PointJsonEntity 外壳，仅 OBS 通道使用）。
 pub fn five_point_wrapper(points: &[Value], start_ms: i64) -> String {
     let five = five_point_payload(points, start_ms);
     json!({
@@ -110,18 +121,33 @@ pub fn five_point_wrapper(points: &[Value], start_ms: i64) -> String {
     .to_string()
 }
 
-/// 校验提交用五点轨迹仍是同一次点位请求产生的有效数据。
+/// 校验提交用五点轨迹仍是同一次点位请求产生的有效数据（record body 直用数组串）。
+pub fn validate_five_point_body(body: &str) -> Result<(), String> {
+    let points: Vec<Value> =
+        serde_json::from_str(body).map_err(|e| format!("五点轨迹数组无效: {e}"))?;
+    validate_five_points(&points)
+}
+
+/// 校验 OBS fixed_point_json wrapper。
+#[allow(dead_code)]
 pub fn validate_five_point_wrapper(wrapper: &str) -> Result<(), String> {
     let outer: Value = serde_json::from_str(wrapper).map_err(|e| format!("五点轨迹 JSON 无效: {e}"))?;
     let raw = outer.get("fivePointJson").and_then(Value::as_str).ok_or("五点轨迹缺少 fivePointJson")?;
     let points: Vec<Value> = serde_json::from_str(raw).map_err(|e| format!("五点轨迹数组无效: {e}"))?;
+    validate_five_points(&points)
+}
+
+fn validate_five_points(points: &[Value]) -> Result<(), String> {
     if points.is_empty() { return Err("五点轨迹不能为空".into()); }
-    for point in points {
+    for (i, point) in points.iter().enumerate() {
         let lat = point.get("lat").and_then(Value::as_f64).unwrap_or(0.0);
         let lon = point.get("lon").and_then(Value::as_f64).unwrap_or(0.0);
         let glat = point.get("glat").and_then(Value::as_f64).unwrap_or(0.0);
         let glon = point.get("glon").and_then(Value::as_f64).unwrap_or(0.0);
         if (lat == 0.0 && lon == 0.0) || (glat == 0.0 && glon == 0.0) { return Err("五点轨迹包含缺失坐标".into()); }
+        // position 必须是 1..N 的序号；999 是官方"非五点"哨兵，会被判定跳过
+        let pos = point.get("position").and_then(Value::as_i64).unwrap_or(0);
+        if pos != i as i64 + 1 { return Err(format!("五点 position 异常: 第{i}点 position={pos}")); }
         crate::location::Coordinate::new(lat, lon, 0.0)?;
         crate::location::Coordinate::new(glat, glon, 0.0)?;
     }
@@ -131,7 +157,17 @@ pub fn validate_five_point_wrapper(wrapper: &str) -> Result<(), String> {
 #[cfg(test)]
 mod validation_tests {
     use super::*;
-    #[test] fn rejects_empty_or_malformed_five_point_payload() { assert!(validate_five_point_wrapper("{}").is_err()); assert!(validate_five_point_wrapper(r#"{"fivePointJson":"[]"}"#).is_err()); }
+    #[test] fn rejects_empty_or_malformed_five_point_payload() {
+        assert!(validate_five_point_wrapper("{}").is_err());
+        assert!(validate_five_point_wrapper(r#"{"fivePointJson":"[]"}"#).is_err());
+        assert!(validate_five_point_body("[]").is_err());
+        assert!(validate_five_point_body("not-json").is_err());
+        // position=999 哨兵必须被拒绝（官方 FivePointPlugin 遇 999 直接跳过判定）
+        let bad = r#"[{"lat":1.0,"lon":2.0,"glat":1.0,"glon":2.0,"position":999}]"#;
+        assert!(validate_five_point_body(bad).is_err());
+        let good = r#"[{"lat":1.0,"lon":2.0,"glat":1.0,"glon":2.0,"position":1}]"#;
+        assert!(validate_five_point_body(good).is_ok());
+    }
 
     #[test]
     fn laps_are_rebuilt_from_overridden_altitude() {
@@ -243,26 +279,36 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
 }
 
 /// 组装 10 键 OBS 对象（值均 gzip+base64；segment_json/runFaceCheck 为空串 gzip）。
+///
+/// `five_wrapper` 为五点 wrapper 串（PointJsonEntity 外壳）；None 时按 live_points 现拼。
 pub fn build_obs_object(
     track: &Track,
     rrid: i64,
     uuid: &str,
     uid: i64,
     live_points: &[Value],
+    five_wrapper: Option<&str>,
 ) -> Value {
     let start_ms = track.startTime;
     let pts: Vec<Value> = track.locations.iter().map(|p| conv_point(p, start_ms)).collect();
     let run_wrap = json!({ "allLocJson": Value::Array(pts).to_string(), "useZip": false });
     let (sp, stf) = build_windows(track, rrid);
     let laps = build_laps(track, start_ms);
-    let five = five_point_payload(live_points, start_ms);
-    let fx = json!({
-        "fivePointJson": Value::Array(five).to_string(),
-        "freedomShowFence": false,
-        "geoFencesJson": "[]",
-        "runAreaId": -1,
-        "useZip": false,
-    });
+    let fx_raw = match five_wrapper {
+        Some(w) => w.to_string(),
+        None => {
+            let five = five_point_payload(live_points, start_ms);
+            json!({
+                "fivePointJson": Value::Array(five).to_string(),
+                "freedomShowFence": false,
+                "geoFencesJson": "[]",
+                "runAreaId": -1,
+                "useZip": false,
+            })
+            .to_string()
+        }
+    };
+    let fx: Value = serde_json::from_str(&fx_raw).unwrap_or(json!({}));
     json!({
         "rrid": gz_str(&rrid.to_string()),
         "uuid": gz_str(uuid),

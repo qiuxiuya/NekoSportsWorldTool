@@ -124,15 +124,17 @@ pub fn build(
     let seg_dist: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
     let speeds: Vec<f64> = w.clone();
 
-    let tl_w = [((-1i64, 4i64), 54u32), ((-1, 1), 27), ((-1, 12), 13), ((-1, 5), 3), ((-1, 6), 2)];
+    // type=-1（无效点）占比压到 ~4%（真人样本 <7% 且多为低位移软漂移）：
+    // 主流量仍是 type=3（GPS 软漂移）与 type=0（正常）。
+    let tl_w = [((-1i64, 4i64), 14u32), ((-1, 1), 9), ((-1, 12), 5), ((-1, 5), 2), ((-1, 6), 1)];
     let mut kinds: Vec<(i64, i64)> = Vec::with_capacity(n);
     for _ in 0..n {
         let u = rng.random();
         if u < 0.39 {
             kinds.push((3, 1));
-        } else if u < 0.93 {
+        } else if u < 0.955 {
             kinds.push((0, 1));
-        } else if u < 0.96 {
+        } else if u < 0.995 {
             kinds.push(rng.weighted(&tl_w));
         } else {
             kinds.push((rng.choice(&[1, 1, 1, 1, 2, 2]), 1));
@@ -218,19 +220,19 @@ pub fn build(
             match lt {
                 4 => {
                     if rng.random() >= 0.68 {
-                        d_step = if rng.random() < 0.95 { rng.uniform(2.0, 60.0) } else { rng.uniform(60.0, 250.0) };
+                        d_step = if rng.random() < 0.95 { rng.uniform(2.0, 40.0) } else { rng.uniform(40.0, 120.0) };
                     }
                 }
                 1 => {
                     if rng.random() >= 0.83 {
-                        d_step = rng.uniform(0.5, 36.0);
+                        d_step = rng.uniform(0.5, 24.0);
                     }
                 }
                 12 => {
-                    d_step = if rng.random() < 0.9 { rng.uniform(5.0, 80.0) } else { rng.uniform(80.0, 220.0) };
+                    d_step = if rng.random() < 0.9 { rng.uniform(4.0, 40.0) } else { rng.uniform(40.0, 100.0) };
                 }
-                5 => d_step = rng.uniform(5.0, 60.0),
-                _ => d_step = rng.uniform(100.0, 300.0),
+                5 => d_step = rng.uniform(4.0, 30.0),
+                _ => d_step = rng.uniform(20.0, 80.0),
             }
             let (bx, by) = pos(s);
             x = bx;
@@ -249,15 +251,15 @@ pub fn build(
                 py = y + jy;
             }
             rad = if lt == 4 {
-                round_to(if rng.random() < 0.75 { rng.uniform(30.0, 100.0) } else { rng.uniform(100.0, 550.0) }, 2)
+                round_to(if rng.random() < 0.75 { rng.uniform(18.0, 60.0) } else { rng.uniform(60.0, 180.0) }, 2)
             } else if lt == 1 {
-                round_to(if rng.random() < 0.75 { rng.uniform(1.6, 12.0) } else { rng.uniform(12.0, 95.0) }, 2)
+                round_to(if rng.random() < 0.75 { rng.uniform(1.6, 8.0) } else { rng.uniform(8.0, 40.0) }, 2)
             } else if lt == 12 {
-                round_to(rng.uniform(30.0, 125.0), 2)
+                round_to(rng.uniform(18.0, 75.0), 2)
             } else if lt == 5 {
-                round_to(rng.uniform(25.0, 300.0), 2)
+                round_to(rng.uniform(15.0, 120.0), 2)
             } else {
-                550.0
+                180.0
             };
             state = rng.weighted(&[(1, 102), (2, 124), (3, 136)]);
         }
@@ -336,7 +338,8 @@ pub fn build(
             bdA: round_to(alt, 2),
             bdD: round_to(brg, 2),
             bdS: round_to((avg_sp * rng.uniform(0.6, 0.95)).max(0.0), 3),
-            bdG: rng.choice(&[1, 1, 1, -1]),
+            // bdG 为 GPS 卫星数：真人样本恒 ≥1（多见 4-9），-1 是无星信号会触发风控/断线
+            bdG: rng.randint(4, 9),
             count: rng.randint(20, 88),
             dtr: 0.0,
             state,

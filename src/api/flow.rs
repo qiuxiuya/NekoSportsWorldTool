@@ -10,7 +10,7 @@ use super::submit::{submit_record, SubmitParams, SubmitResult};
 use crate::location::Coordinate;
 use crate::track::generate_road::RouteMode;
 use crate::track::generator::build as gen_track;
-use crate::track::wire::{build_obs_object, five_point_wrapper, obs_keys};
+use crate::track::wire::{build_obs_object, five_point_body, five_point_wrapper, obs_keys};
 use rand_distr::{Distribution, Normal};
 use serde_json::Value;
 
@@ -358,9 +358,9 @@ pub fn run_full_flow(
         net,
     ));
 
-    // ④ 五点 wrapper（跑完态）
-    let five = five_point_wrapper(&pts, track.startTime);
-    let _ = &five;
+    // ④ 五点（跑完态）：record body 用数组串，OBS fixed_point_json 用 wrapper
+    let five = five_point_body(&pts, track.startTime);
+    let five_wrap = five_point_wrapper(&pts, track.startTime);
 
     // ⑤ 提交（sportType=1）
     log("[record] 提交跑步记录（sportType=1）…");
@@ -384,7 +384,8 @@ pub fn run_full_flow(
     // 从提交结果回填 track.startTime（含随机秒偏移），保证 body/OBS/flag 全链一致
     let mut track_for_obs = sp.track.clone();
     track_for_obs.startTime = result.start_ms;
-    let obj = build_obs_object(&track_for_obs, result.rrid, &result.uuid, sess.uid, &pts);
+    // OBS fixed_point_json wrapper 同步携带 rrid 后的窗序（与 record 通道数组串共存）
+    let obj = build_obs_object(&track_for_obs, result.rrid, &result.uuid, sess.uid, &pts, Some(&five_wrap));
     let payload = obj.to_string().into_bytes();
     let keys = obs_keys(&track_for_obs, result.rrid, &result.uuid);
     let obs_ok = super::obs::upload_both_keys(client, &keys, &payload, log);
