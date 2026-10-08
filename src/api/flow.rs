@@ -1,4 +1,4 @@
-//! 全链编排：policy → 实时点位 → 轨迹生成 → 提交 → OBS → 详情验证。
+w   //! 全链编排：policy → 实时点位 → 轨迹生成 → 提交 → OBS → 详情验证。
 //! 由 UI 后台线程调用，log 闭包回传日志。
 
 use super::client::ApiClient;
@@ -10,7 +10,7 @@ use super::submit::{submit_record, SubmitParams, SubmitResult};
 use crate::location::Coordinate;
 use crate::track::generate_road::RouteMode;
 use crate::track::generator::build as gen_track;
-use crate::track::wire::{build_obs_object, five_point_body, five_point_wrapper, obs_keys};
+use crate::track::wire::{build_obs_object, five_point_wrapper_with_area, obs_keys};
 use rand_distr::{Distribution, Normal};
 use serde_json::Value;
 
@@ -79,11 +79,33 @@ pub fn run_full_flow(
         return Err("请先在设备信息页填写本次跑步所在城市和定位锚点，不能使用大连默认配置".into());
     }
     let anchor: Coordinate = client.identity.anchor_coordinate()?;
-    let pts = points::fetch_points(client, anchor, log)?;
-    if pts.is_empty() {
+    // 携带策略下发的 runAreaId 拉点位；点位响应回传围栏（详情页绿色边界/目标点）
+    let requested_area_id = (pol.area.run_area_id >= 0).then(|| pol.area.run_area_id.to_string());
+    let mut points_ctx = points::fetch_points_context_ext(client, anchor, requested_area_id, log)?;
+    // 策略下发的区域信息优先（与 App 一致）
+    if pol.area.run_area_id >= 0 {
+        points_ctx.area.run_area_id = pol.area.run_area_id;
+    }
+    if pol.area.geo_fences_json.trim() != "[]"
+        && pol.area.freedom_show_fence
+        && serde_json::from_str::<Value>(&pol.area.geo_fences_json).is_ok()
+    {
+        points_ctx.area.geo_fences_json = pol.area.geo_fences_json.clone();
+        points_ctx.area.freedom_show_fence = pol.area.freedom_show_fence;
+    }
+    let pts = points_ctx.points.clone();
+    // 学校明确无点位（10600）：允许继续，后续回退自由跑；完全不透明地拿到空列表才拒绝。
+    if pts.is_empty() && !points_ctx.no_points {
         return Err("实时点位为空 —— 拒绝本地样本兜底".into());
     }
-    log(&format!("√ [points] {} 个点位", pts.len()));
+    log(&format!(
+        "√ [points] {} 个点位，runAreaId={}，绿色围栏={}（{} 字节）{}",
+        pts.len(),
+        points_ctx.area.run_area_id,
+        points_ctx.area.freedom_show_fence,
+        points_ctx.area.geo_fences_json.len(),
+        if points_ctx.no_points { "（学校未设置点位，回退自由跑）" } else { "" },
+    ));
     for p in pts.iter().take(5) {
         log(&format!(
             "  [points] {} BD=({:.6},{:.6}) GCJ=({},{})",
@@ -150,9 +172,10 @@ pub fn run_full_flow(
         if let Err(e) = super::model::save_identity(&client.identity) {
             log(&format!("⚠ 锚点持久化失败: {e}"));
         }
-        // 用漂移后的新锚点重存点位缓存，使缓存锚点与持久化锚点一致，避免预览锚点失配。
+        // 用漂移后的新锚点重存点位缓存，使缓存锚点与持久化锚点一致，避免预览锚点失配；
+        // 同时保留区域元数据，供下次详情页绿色围栏使用。
         if let Ok(new_anchor) = client.identity.anchor_coordinate() {
-            let _ = super::model::save_points_cache(new_anchor, &pts);
+            let _ = super::model::save_points_cache_context(new_anchor, &pts, &points_ctx.area);
         }
     }
     // 平均配速须落在有效窗口内（否则逐点速度无法全窗内），越界时修正时长
@@ -358,9 +381,18 @@ pub fn run_full_flow(
         net,
     ));
 
-    // ④ 五点（跑完态）：record body 用数组串，OBS fixed_point_json 用 wrapper
-    let five = five_point_body(&pts, track.startTime);
-    let five_wrap = five_point_wrapper(&pts, track.startTime);
+    // 无点位学校（10600）：回退自由跑——不传五点、policy 置 0、跳过五点校验。
+    // 有打卡点：五点 wrapper（跑完态，record body 与 OBS fixed_point_json 共用），
+    // 携带服务端区域元数据（runAreaId + geoFencesJson），否则详情页只显示灰线、无目标点。
+    let free_run = points_ctx.no_points || pts.is_empty();
+    let (five, five_wrap) = if free_run {
+        log("⚠ [points] 学校未设置点位，按自由跑提交（不传 fivePointJson）");
+        (String::new(), String::new())
+    } else {
+        let w = five_point_wrapper_with_area(&pts, track.startTime, &points_ctx.area);
+        (w.clone(), w)
+    };
+    let policy_value = if free_run { 0 } else { pol.policy };
 
     // ⑤ 提交（sportType=1）
     log("[record] 提交跑步记录（sportType=1）…");
@@ -368,7 +400,7 @@ pub fn run_full_flow(
         track,
         uid: sess.uid,
         selected_unid: sess.unid.parse().unwrap_or(0),
-        policy: pol.policy,
+        policy: policy_value,
         policy_ts: pol.timestamp,
         min_distance: pol.min_distance,
         weight: if sess.weight > 0.0 { sess.weight } else { 68.0 },
@@ -380,12 +412,18 @@ pub fn run_full_flow(
     sleep_secs(1);
 
     // ⑥ OBS 上传（双 key）
-    log("[obs] 上传 OBS 对象（gzip+base64，10 键）…");
     // 从提交结果回填 track.startTime（含随机秒偏移），保证 body/OBS/flag 全链一致
     let mut track_for_obs = sp.track.clone();
     track_for_obs.startTime = result.start_ms;
     // OBS fixed_point_json wrapper 同步携带 rrid 后的窗序（与 record 通道数组串共存）
-    let obj = build_obs_object(&track_for_obs, result.rrid, &result.uuid, sess.uid, &pts, Some(&five_wrap));
+    // 自由跑无五点：传 None（按 live_points 现拼；pts 空则 fixed 为空）
+    let five_opt = (!five_wrap.is_empty()).then_some(five_wrap.as_str());
+    let obj = build_obs_object(&track_for_obs, result.rrid, &result.uuid, sess.uid, &pts, five_opt);
+    let seg_n = crate::track::wire::segment_count(&track_for_obs);
+    log(&format!(
+        "[obs] 上传 OBS 对象（gzip+base64，11 键；分段 {seg_n} 段 state=0；runAreaId={}）…",
+        points_ctx.area.run_area_id
+    ));
     let payload = obj.to_string().into_bytes();
     let keys = obs_keys(&track_for_obs, result.rrid, &result.uuid);
     let obs_ok = super::obs::upload_both_keys(client, &keys, &payload, log);

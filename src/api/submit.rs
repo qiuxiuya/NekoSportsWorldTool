@@ -12,23 +12,20 @@ use crate::crypto::sign::{original_sign, signature};
 use crate::track::calorie::{avg_power, official_kcal};
 use crate::track::geom::round_to;
 use crate::track::model::{GenPoint, Track};
-use crate::track::wire::validate_five_point_body;
+use crate::track::wire::validate_five_point_wrapper;
 use serde_json::{json, Map, Value};
 
 pub const RECORD_PATH: &str = "/api/v70260/runnings/save/record";
 
-/// Android 10s 窗。
+/// Android 10s 窗（对齐原项目：id 种子 60000，body 内非空）。
 ///
-/// 逆向对照（StepsPerTenSec/SpeedPerTenSec 实体 + wire::build_windows 实测向量）：
-/// id = (rrid%100000)*1000 + 窗口结束秒；queueNum 随窗序递增；
-/// minDiff 真人样本为 1000.0（步频差千分位）。
-/// 提交体官方恒为空数组；本函数保留给 UI 明细重建（record rrid 回填后）复用。
-#[allow(dead_code)]
-pub fn android_tensec(track: &Track, start_ms: i64, rrid: i64, kind: &str) -> Vec<Value> {
+/// 原项目把 speedPerTenSec/stepsPerTenSec 作为非空数组提交；`bc922b8` 误改为
+/// 空数组。此处回退为原项目行为。
+pub fn android_tensec(track: &Track, start_ms: i64, kind: &str) -> Vec<Value> {
     let locs = &track.locations;
     let total_time = track.totalTime;
     let mut out = Vec::new();
-    let id_seed = (rrid % 100000) * 1000;
+    let rid_seed = 60000i64;
     let mut w = 10i64;
     while w <= total_time {
         let lo = w - 10;
@@ -53,7 +50,7 @@ pub fn android_tensec(track: &Track, start_ms: i64, rrid: i64, kind: &str) -> Ve
         let begin = start_ms + lo * 1000;
         let end = start_ms + hi * 1000;
         let qn = w / 10 - 1;
-        let id = id_seed + hi;
+        let id = rid_seed + qn;
         if kind == "speed" {
             out.push(json!({
                 "beginTime": begin, "distance": dist, "endTime": end,
@@ -97,7 +94,8 @@ fn average_step_frequency(total_steps: i64, total_time: i64) -> i64 {
     (total_steps as f64 / total_time as f64 * 60.0).round() as i64
 }
 
-/// 服务端配速单位：千分之一分钟/公里（毫配速），不再乘 1024。
+/// 服务端毫配速（不含原项目的 ×1024），保留仅供诊断/明细复用。
+#[allow(dead_code)]
 pub fn pace_speed_value(total_time_s: i64, distance_m: f64) -> i64 {
     let distance_m = (distance_m * 100.0).ceil() / 100.0;
     if distance_m <= 0.0 {
@@ -138,8 +136,10 @@ pub struct SubmitResult {
 pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnMut(&str)) -> Result<SubmitResult, String> {
     let track = &p.track;
     let start_coordinate = track.validate_consistency()?;
-    if p.five_point_json.is_empty() { return Err("五点轨迹不能为空".into()); }
-    validate_five_point_body(&p.five_point_json)?;
+    // 自由跑（无点位学校回退）不传五点；有则必须是有效 wrapper。
+    if !p.five_point_json.is_empty() {
+        validate_five_point_wrapper(&p.five_point_json)?;
+    }
     let total_time = track.totalTime;
     let total_dis = track.totalDistance;
     let total_steps = track.totalSteps;
@@ -151,12 +151,10 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
 
     let run_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
     let unid = p.selected_unid;
-    // rrid 提交前不可知：10s 窗 id 需要 rrid 派生种子，服务端以提交响应 rrid 为准
-    // 重建窗口（见提交成功后的二次组装），这里先按 0 种子占位。
-    //（提交体中 speedPerTenSec/stepsPerTenSec 官方恒为空数组，实际窗口走 OBS，
-    //  此处保留空数组与官方行为一致。）
 
-    let speed = pace_speed_value(total_time, total_dis);
+    // 原项目：speed = round(时长s / 距离km，2) × 1024（毫配速）
+    let dis_ceil = (total_dis * 100.0).ceil() / 100.0;
+    let speed = (round_to(total_time as f64 / dis_ceil * 50.0 / 3.0, 2) * 1024.0) as i64;
     let avg_step_freq = 1i64.max(average_step_frequency(total_steps, total_time));
 
     let mut body = Map::new();
@@ -171,6 +169,7 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
     body.insert("uuid".into(), Value::String(run_uuid.clone()));
     body.insert("uid".into(), Value::from(p.uid));
     body.insert("selectedUnid".into(), Value::from(unid));
+    // 原项目：selRunTime = totalTime
     body.insert("selRunTime".into(), Value::from(total_time));
     body.insert("selDistance".into(), Value::from(p.min_distance));
     body.insert("totalDis".into(), Value::from(round_to(total_dis, 0) as i64));
@@ -184,15 +183,12 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
     body.insert("avgStepFreq".into(), Value::from(avg_step_freq));
     body.insert("useMobilityTools".into(), Value::from(0));
     body.insert("faceCheck".into(), Value::from(p.face_check));
-    // 逆向 UploadSignEntity.totalAscent 为 int：签名串 String.valueOf(int) 是整数，
-    // 浮点会让服务端按 int 截断后重算签名 → 10501 验证签名失败。
-    // 官方 setTotalAscent(int) 对 double 隐式截断（非四舍五入），此处对齐为截断。
-    body.insert("totalAscent".into(), Value::from(ascent as i64));
+    // 原项目：totalAscent = round_to(ascent, 0) as i64
+    body.insert("totalAscent".into(), Value::from(round_to(ascent, 0) as i64));
     body.insert("avgPower".into(), Value::from(power));
-    // 官方 RunUploadHelper 恒 setStepsPerTenSec(空)/setSpeedPerTenSec(空)，
-    // 明细窗口仅走 OBS 通道；保留空数组避免服务端双份窗口对账不一致。
-    body.insert("speedPerTenSec".into(), Value::Array(Vec::new()));
-    body.insert("stepsPerTenSec".into(), Value::Array(Vec::new()));
+    // 原项目：非空 10s 窗口数组
+    body.insert("speedPerTenSec".into(), Value::Array(android_tensec(track, start_ms, "speed")));
+    body.insert("stepsPerTenSec".into(), Value::Array(android_tensec(track, start_ms, "steps")));
     body.insert("isUpload".into(), Value::Bool(false));
     body.insert("more".into(), Value::Bool(false));
     body.insert("latitude".into(), Value::from(start_coordinate.latitude));
@@ -207,6 +203,7 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
     body.insert("geeToken".into(), Value::String(String::new()));
     body.insert("unauthorized".into(), Value::from(0));
     body.insert("themeId".into(), Value::from(0));
+    // 原项目：goalId = null（签名串 "null"）
     body.insert("goalId".into(), Value::Null);
     body.insert("address".into(), Value::String(p.address.trim().to_string()));
 
@@ -247,6 +244,9 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
     for (k, v) in &hp_extra {
         req = req.set(k, v);
     }
+    // 请求明文日志：body（签名后完整业务字段）与 headerSign 明文，便于对照逆向定位 -10000。
+    log(&format!("[record] req header={}", crate::textlog::truncate(&hp, 600)));
+    log(&format!("[record] req body={}", crate::textlog::truncate(&body_plain, 900)));
     let resp = req.send_string(&body_env.json).map_err(ureq_err)?;
     let status = resp.status();
     let raw = resp.into_string().unwrap_or_default();
@@ -257,8 +257,62 @@ pub fn submit_record(client: &mut ApiClient, p: &SubmitParams, log: &mut dyn FnM
     );
     let dec = decrypt_response(raw.as_bytes(), &key, &rsa_public_key())
         .map_err(|e| format!("提交响应解密失败: {e}"))?;
-    let biz = check_business(&dec.business)?;
-    let rrid = super::client::get_field(&biz, "rrid").and_then(|v| v.as_i64()).unwrap_or(0);
+    // 先打印解密后的业务 JSON（成功/失败都要看得到服务端拒绝原因）。
+    let mut biz = dec.business.clone();
+    log(&format!("[record] resp biz={}", truncate_json(&biz)));
+    // -10000「服务器开小差」为服务端内部异常（data=null）；官方 App 是留存本地稍后重传。
+    // 客户端做有限次退避重试：每次必须重建 header 明文（含新 timeStamp）与 body 信封，
+    // 否则同一 headerSign 明文重复使用会被服务端判 10007。
+    if biz.get("error").and_then(|v| v.as_i64()).unwrap_or(0) == -10000 {
+        for attempt in 1u64..=2 {
+            log(&format!("[record] 服务端异常(-10000)，{attempt}/2 次重试…"));
+            std::thread::sleep(std::time::Duration::from_secs(2 * attempt));
+            let (retry_hp, retry_hp_extra) =
+                build_android_header(&android_identity, p.uid, &client_token(client), None);
+            let retry_header = build_envelope(&mut client.session, &retry_hp, OuterOrder::Observed);
+            let retry_body = build_envelope_ts(
+                &mut client.session,
+                &body_plain,
+                OuterOrder::Insert,
+                crate::crypto::envelope::now_ms() + 1,
+            );
+            let mut rreq = client.agent.post(&format!("{HOST}{RECORD_PATH}"));
+            rreq = rreq
+                .set("Content-Type", "application/json; charset=utf-8")
+                .set("User-Agent", UA_ANDROID)
+                .set("appVersion", "7.3.40")
+                .set("headerSign", &retry_header.json)
+                .set("runes", &runes)
+                .set("runef", &runef);
+            for (k, v) in &retry_hp_extra {
+                rreq = rreq.set(k, v);
+            }
+            let Ok(rr) = rreq.send_string(&retry_body.json) else { continue };
+            let rs = rr.status();
+            let rraw = rr.into_string().unwrap_or_default();
+            log(&format!("[record] 重试 HTTP {rs} len={}", rraw.len()));
+            let rkey = derive_paes_key(
+                &retry_body.key_data[0], &retry_body.key_data[1],
+                &retry_body.key_data[2], &retry_body.key_data[3],
+            );
+            if let Ok(rdec) = decrypt_response(rraw.as_bytes(), &rkey, &rsa_public_key()) {
+                log(&format!("[record] 重试 resp biz={}", truncate_json(&rdec.business)));
+                if rdec.business.get("error").and_then(|v| v.as_i64()).unwrap_or(0) == 10000 {
+                    biz = rdec.business;
+                    break;
+                }
+            }
+        }
+    }
+    let biz = check_business(&biz)?;
+    // 响应为 BasicBean<GetDrawChanceBean>：rrid 在 data 内，而 data 可能是 JSON 字符串
+    // （与点位/OBS 接口同款包裹），也可能是对象；解析后优先 data.rrid，再兜底顶层 rrid。
+    let data = super::client::parse_data_field(&biz);
+    let rrid = data
+        .get("rrid")
+        .and_then(|v| v.as_i64())
+        .or_else(|| super::client::get_field(&biz, "rrid").and_then(|v| v.as_i64()))
+        .unwrap_or(0);
     if rrid <= 0 {
         return Err(format!("提交未返回 rrid: {}", truncate_json(&biz)));
     }

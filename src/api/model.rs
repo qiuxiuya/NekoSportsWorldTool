@@ -442,30 +442,62 @@ struct PointsCache {
     ts: i64,
     anchor: crate::location::Coordinate,
     points: Vec<serde_json::Value>,
+    #[serde(default = "default_run_area_id")]
+    run_area_id: i64,
+    #[serde(default)]
+    geo_fences_json: String,
+    #[serde(default)]
+    freedom_show_fence: bool,
+}
+
+fn default_run_area_id() -> i64 {
+    -1
 }
 
 /// 只返回与本次锚点相同的缓存。旧版未记录锚点的缓存会自然失效，避免串城市。
 pub fn load_points_cache_for(
     anchor: crate::location::Coordinate,
 ) -> Option<(i64, Vec<serde_json::Value>)> {
+    load_points_cache_context_for(anchor).map(|(ts, points, _)| (ts, points))
+}
+
+/// 带区域元数据的缓存读取（详情页围栏/目标点来源）。
+pub fn load_points_cache_context_for(
+    anchor: crate::location::Coordinate,
+) -> Option<(i64, Vec<serde_json::Value>, crate::track::wire::RunAreaMeta)> {
     let v: serde_json::Value = read_json("points_cache.json")?;
     let cache: PointsCache = serde_json::from_value(v).ok()?;
     if !cache.anchor.is_near(anchor, 0.0001) {
         return None;
     }
-    let ts = cache.ts;
-    let pts = cache.points;
-    Some((ts, pts))
+    let area = crate::track::wire::RunAreaMeta {
+        run_area_id: cache.run_area_id,
+        geo_fences_json: if cache.geo_fences_json.trim().is_empty() { "[]".into() } else { cache.geo_fences_json },
+        freedom_show_fence: cache.freedom_show_fence,
+    };
+    Some((cache.ts, cache.points, area))
 }
 
+#[allow(dead_code)]
 pub fn save_points_cache(
     anchor: crate::location::Coordinate,
     points: &[serde_json::Value],
+) -> Result<(), String> {
+    save_points_cache_context(anchor, points, &crate::track::wire::RunAreaMeta::default())
+}
+
+pub fn save_points_cache_context(
+    anchor: crate::location::Coordinate,
+    points: &[serde_json::Value],
+    area: &crate::track::wire::RunAreaMeta,
 ) -> Result<(), String> {
     let doc = PointsCache {
         ts: crate::crypto::envelope::now_ms(),
         anchor,
         points: points.to_vec(),
+        run_area_id: area.run_area_id,
+        geo_fences_json: area.geo_fences_json.clone(),
+        freedom_show_fence: area.freedom_show_fence,
     };
     write_json("points_cache.json", &doc)
 }
@@ -479,6 +511,9 @@ mod points_cache_tests {
             ts: 1,
             anchor: crate::location::Coordinate::new(39.9, 116.4, 0.0).unwrap(),
             points: vec![],
+            run_area_id: -1,
+            geo_fences_json: "[]".into(),
+            freedom_show_fence: false,
         };
         let decoded: PointsCache =
             serde_json::from_value(serde_json::to_value(cache).unwrap()).unwrap();

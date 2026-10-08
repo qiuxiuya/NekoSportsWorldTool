@@ -304,17 +304,25 @@ mod tests {
             keys,
             vec![
                 "rrid",
-                "uuid",
                 "uid",
+                "uuid",
                 "run_data",
-                "fixed_point_json",
-                "segment_json",
-                "speed_json",
                 "step_freq_json",
-                "laps_json",
-                "runFaceCheck"
+                "speed_json",
+                "segment_json",
+                "fixed_point_json",
+                "runFaceCheck",
+                "extension_json",
+                "laps_json"
             ]
         );
+        // extension_json 空串 gzip
+        let raw =
+            crate::crypto::envelope::b64_decode(obj["extension_json"].as_str().unwrap()).unwrap();
+        let mut dec = flate2::read::GzDecoder::new(&raw[..]);
+        let mut s = String::new();
+        dec.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "");
         // rrid gzip 可解
         let raw = crate::crypto::envelope::b64_decode(obj["rrid"].as_str().unwrap()).unwrap();
         let mut dec = flate2::read::GzDecoder::new(&raw[..]);
@@ -331,14 +339,16 @@ mod tests {
         assert_eq!(wrap["useZip"], false);
         let pts: Vec<serde_json::Value> =
             serde_json::from_str(wrap["allLocJson"].as_str().unwrap()).unwrap();
-        assert_eq!(pts[0].as_object().unwrap().len(), 27, "点键数必须 27");
-        // segment_json 是空串 gzip
+        assert_eq!(pts[0].as_object().unwrap().len(), 28, "点键数必须 28");
+        // segment_json 为分段有效性列表（非空，全部 state=0，避免详情地图整段判灰）
         let raw =
             crate::crypto::envelope::b64_decode(obj["segment_json"].as_str().unwrap()).unwrap();
         let mut dec = flate2::read::GzDecoder::new(&raw[..]);
         let mut s = String::new();
         dec.read_to_string(&mut s).unwrap();
-        assert_eq!(s, "");
+        let segs: Vec<serde_json::Value> = serde_json::from_str(&s).unwrap();
+        assert!(!segs.is_empty(), "segment_json 不应为空");
+        assert!(segs.iter().all(|x| x["state"] == 0), "所有分段应为有效(state=0)");
         // obs keys 两个
         let ks = obs_keys(&track, 1320403809, "UUID-TEST");
         assert_eq!(ks.len(), 2);

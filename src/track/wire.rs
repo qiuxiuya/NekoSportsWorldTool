@@ -15,6 +15,33 @@ use super::model::{GenPoint, Track};
 
 const X_PI: f64 = std::f64::consts::PI * 3000.0 / 180.0;
 
+/// 跑步区域元数据（点位/策略接口下发）。
+///
+/// 详情页用 `runAreaId` + `geoFencesJson`（绿色围栏）画出活动区域与目标点；
+/// 缺失或无效时回退默认（-1 / "[]" / false），此时详情页只显示灰线。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunAreaMeta {
+    pub run_area_id: i64,
+    pub geo_fences_json: String,
+    pub freedom_show_fence: bool,
+}
+
+impl Default for RunAreaMeta {
+    fn default() -> Self {
+        Self { run_area_id: -1, geo_fences_json: "[]".into(), freedom_show_fence: false }
+    }
+}
+
+/// 保留服务端返回的有效围栏；`-1` 表示接口未提供区域 ID，不应抹掉真实围栏。
+fn payload_area(area: &RunAreaMeta) -> RunAreaMeta {
+    let valid = area.run_area_id >= -1
+        && area.freedom_show_fence
+        && serde_json::from_str::<Value>(&area.geo_fences_json)
+            .ok()
+            .is_some_and(|v| matches!(v, Value::Array(ref items) if !items.is_empty()));
+    if valid { area.clone() } else { RunAreaMeta::default() }
+}
+
 /// 百度 BD-09 → 高德 GCJ-02。
 pub fn bd09_to_gcj02(bd_lat: f64, bd_lng: f64) -> (f64, f64) {
     let x = bd_lng - 0.0065;
@@ -40,7 +67,9 @@ fn gz_str(v: &str) -> String {
     gz(v.as_bytes())
 }
 
-/// 27 键协议点集（gen 点 → OBS 点；gLat/gLng 由 BD 转 GCJ）。
+/// 28 键协议点集（gen 点 → OBS 点；gLat/gLng 由 BD 转 GCJ）。
+/// 必须含每点 `steps` 与真实 `stepDistance`：缺任一项服务端逐点步数校验失败，
+/// 详情页会把该段轨迹标灰（原项目 conv_point 同为 28 键）。
 pub fn conv_point(p: &GenPoint, start_ms: i64) -> Value {
     let (glat, glng) = bd09_to_gcj02(p.gLat, p.gLng);
     json!({
@@ -64,8 +93,9 @@ pub fn conv_point(p: &GenPoint, start_ms: i64) -> Value {
         "queueNum": p.queueNum,
         "radius": round_to(p.radius, 2),
         "speed": round_to(p.speed, 4),
+        "steps": p.steps,
         "state": p.state,
-        "stepDistance": 0.0,
+        "stepDistance": round_to(p.stepDistance, 4),
         "totalDis": round_to(p.totalDis, 4),
         "totalTime": p.totalTime,
         "type": p.ptype,
@@ -76,60 +106,76 @@ pub fn conv_point(p: &GenPoint, start_ms: i64) -> Value {
 
 /// 五点实体（实时点位 → 跑完态 isPass=true）。
 ///
-/// 逆向对照（FivePointPlugin / FivePoint 实体）：
-/// - position 必须是 1..5 的序号；999 是"非五点"哨兵，会被判定直接跳过；
-/// - id 用点位接口返回的真实 id（缺失则退化为 1..5）；
-/// - isFixed=1 表示顺序必经点（SEQUENTIAL 策略），随机策略为 0。
+/// 对齐原项目（demacia/yanami 可自用默认）：
+/// - `isFixed` 恒 **1**（五点均为必经点）；
+/// - `id`/`position`/`state`/`coorType` 优先取服务端点位返回的字段，
+///   缺失才回退；`position` 回退 **999**（服务端"已通过的必经点"兼容格式，
+///   与逆向 FivePoint 默认哨兵 `Config.InteractStyleType.RAIN=999` 一致）；
+/// - `id` 回退 1..N，`state` 回退 0。
 pub fn five_point_payload(points: &[Value], start_ms: i64) -> Vec<Value> {
     points
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            json!({
+            let mut obj = json!({
                 "flag": start_ms,
                 "glat": p["glat"].as_f64().unwrap_or(0.0),
                 "glon": p["glon"].as_f64().unwrap_or(0.0),
-                "id": p["id"].as_i64().unwrap_or(i as i64 + 1),
-                "isFixed": p["isFixed"].as_i64().unwrap_or(0),
+                "isFixed": 1,
                 "isPass": true,
                 "lat": p["lat"].as_f64().unwrap_or(0.0),
                 "lon": p["lon"].as_f64().unwrap_or(0.0),
                 "pointName": p["pointName"].as_str().unwrap_or(""),
-                "position": i as i64 + 1,
-                "state": 0,
-            })
+            });
+            let map = obj.as_object_mut().expect("五点 payload 是对象");
+            if let Some(v) = p.get("id").and_then(Value::as_i64) {
+                map.insert("id".into(), Value::from(v));
+            }
+            if let Some(v) = p.get("position").and_then(Value::as_i64) {
+                map.insert("position".into(), Value::from(v));
+            }
+            if let Some(v) = p.get("state").and_then(Value::as_i64) {
+                map.insert("state".into(), Value::from(v));
+            }
+            if let Some(v) = p.get("coorType").and_then(Value::as_str) {
+                map.insert("coorType".into(), Value::from(v));
+            }
+            if !map.contains_key("id") {
+                map.insert("id".into(), Value::from(i as i64 + 1));
+            }
+            if !map.contains_key("position") {
+                map.insert("position".into(), Value::from(999));
+            }
+            if !map.contains_key("state") {
+                map.insert("state".into(), Value::from(0));
+            }
+            obj
         })
         .collect()
 }
 
-/// record body 的 fivePointJson：官方 UploadFormatEntity 直接放 FivePoint 数组的
-/// JSON 字符串（RunUploadHelper: `toJson(list3)`），不是 wrapper。
-pub fn five_point_body(points: &[Value], start_ms: i64) -> String {
-    Value::Array(five_point_payload(points, start_ms)).to_string()
+/// OBS fixed_point_json 键的 wrapper（PointJsonEntity 外壳）。
+/// 原项目 record body 的 fivePointJson 也用此 wrapper。
+#[allow(dead_code)]
+pub fn five_point_wrapper(points: &[Value], start_ms: i64) -> String {
+    five_point_wrapper_with_area(points, start_ms, &RunAreaMeta::default())
 }
 
-/// OBS fixed_point_json 键的 wrapper（PointJsonEntity 外壳，仅 OBS 通道使用）。
-pub fn five_point_wrapper(points: &[Value], start_ms: i64) -> String {
+/// 携带服务端区域/围栏元数据的 wrapper（record body 与 OBS 共用）。
+pub fn five_point_wrapper_with_area(points: &[Value], start_ms: i64, area: &RunAreaMeta) -> String {
     let five = five_point_payload(points, start_ms);
+    let area = payload_area(area);
     json!({
         "useZip": false,
         "fivePointJson": Value::Array(five).to_string(),
-        "runAreaId": -1,
-        "geoFencesJson": "[]",
-        "freedomShowFence": false,
+        "runAreaId": area.run_area_id,
+        "geoFencesJson": area.geo_fences_json,
+        "freedomShowFence": area.freedom_show_fence,
     })
     .to_string()
 }
 
-/// 校验提交用五点轨迹仍是同一次点位请求产生的有效数据（record body 直用数组串）。
-pub fn validate_five_point_body(body: &str) -> Result<(), String> {
-    let points: Vec<Value> =
-        serde_json::from_str(body).map_err(|e| format!("五点轨迹数组无效: {e}"))?;
-    validate_five_points(&points)
-}
-
-/// 校验 OBS fixed_point_json wrapper。
-#[allow(dead_code)]
+/// 校验五点 wrapper（record body 与原项目一致，用 wrapper）。
 pub fn validate_five_point_wrapper(wrapper: &str) -> Result<(), String> {
     let outer: Value = serde_json::from_str(wrapper).map_err(|e| format!("五点轨迹 JSON 无效: {e}"))?;
     let raw = outer.get("fivePointJson").and_then(Value::as_str).ok_or("五点轨迹缺少 fivePointJson")?;
@@ -145,11 +191,15 @@ fn validate_five_points(points: &[Value]) -> Result<(), String> {
         let glat = point.get("glat").and_then(Value::as_f64).unwrap_or(0.0);
         let glon = point.get("glon").and_then(Value::as_f64).unwrap_or(0.0);
         if (lat == 0.0 && lon == 0.0) || (glat == 0.0 && glon == 0.0) { return Err("五点轨迹包含缺失坐标".into()); }
-        // position 必须是 1..N 的序号；999 是官方"非五点"哨兵，会被判定跳过
-        let pos = point.get("position").and_then(Value::as_i64).unwrap_or(0);
-        if pos != i as i64 + 1 { return Err(format!("五点 position 异常: 第{i}点 position={pos}")); }
         crate::location::Coordinate::new(lat, lon, 0.0)?;
         crate::location::Coordinate::new(glat, glon, 0.0)?;
+        // 原项目要求五点均为跑完态必经点
+        if point.get("isPass").and_then(Value::as_bool) != Some(true) {
+            return Err(format!("五点轨迹第 {} 个点未标记 isPass=true", i + 1));
+        }
+        if point.get("isFixed").and_then(Value::as_i64) != Some(1) {
+            return Err(format!("五点轨迹第 {} 个点未标记 isFixed=1", i + 1));
+        }
     }
     Ok(())
 }
@@ -160,13 +210,25 @@ mod validation_tests {
     #[test] fn rejects_empty_or_malformed_five_point_payload() {
         assert!(validate_five_point_wrapper("{}").is_err());
         assert!(validate_five_point_wrapper(r#"{"fivePointJson":"[]"}"#).is_err());
-        assert!(validate_five_point_body("[]").is_err());
-        assert!(validate_five_point_body("not-json").is_err());
-        // position=999 哨兵必须被拒绝（官方 FivePointPlugin 遇 999 直接跳过判定）
-        let bad = r#"[{"lat":1.0,"lon":2.0,"glat":1.0,"glon":2.0,"position":999}]"#;
-        assert!(validate_five_point_body(bad).is_err());
-        let good = r#"[{"lat":1.0,"lon":2.0,"glat":1.0,"glon":2.0,"position":1}]"#;
-        assert!(validate_five_point_body(good).is_ok());
+        assert!(validate_five_point_wrapper("not-json").is_err());
+        // 原项目语义：五点均 isPass=true 且 isFixed=1；position 回退 999
+        let ok = r#"{"fivePointJson":"[{\"lat\":1.0,\"lon\":2.0,\"glat\":1.0,\"glon\":2.0,\"isFixed\":1,\"isPass\":true,\"position\":999}]"}"#;
+        assert!(validate_five_point_wrapper(ok).is_ok());
+        // 缺 isPass / isFixed!=1 拒绝
+        let no_pass = r#"{"fivePointJson":"[{\"lat\":1.0,\"lon\":2.0,\"glat\":1.0,\"glon\":2.0,\"isFixed\":1,\"position\":999}]"}"#;
+        assert!(validate_five_point_wrapper(no_pass).is_err());
+        let not_fixed = r#"{"fivePointJson":"[{\"lat\":1.0,\"lon\":2.0,\"glat\":1.0,\"glon\":2.0,\"isFixed\":0,\"isPass\":true,\"position\":999}]"}"#;
+        assert!(validate_five_point_wrapper(not_fixed).is_err());
+        // payload 生成侧：isFixed 恒 1、isPass=true、position 缺省 999
+        let pts = vec![serde_json::json!({"lat":1.0,"lon":2.0,"glat":1.0,"glon":2.0,"id":11})];
+        let wrap = five_point_wrapper(&pts, 1000);
+        let outer: serde_json::Value = serde_json::from_str(&wrap).unwrap();
+        let inner: Vec<serde_json::Value> =
+            serde_json::from_str(outer["fivePointJson"].as_str().unwrap()).unwrap();
+        assert_eq!(inner[0]["isFixed"], 1);
+        assert_eq!(inner[0]["isPass"], true);
+        assert_eq!(inner[0]["position"], 999);
+        assert!(validate_five_point_wrapper(&wrap).is_ok());
     }
 
     #[test]
@@ -237,9 +299,10 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
     let alt0 = locs.first().map(|p| p.bdA).unwrap_or(0.0);
     for (i, pt) in locs.iter().enumerate() {
         if i > 0 {
+            // 原项目：圈爬升/下降按原始差分累计（不做单点噪声过滤）
             let dd = pt.bdA - locs[i - 1].bdA;
             if dd > 0.0 {
-                gain += crate::track::altitude::positive_ascent_delta(dd);
+                gain += dd;
             } else {
                 loss += -dd;
             }
@@ -253,8 +316,9 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
             let lap_steps = pt.steps - prev_steps;
             laps.push(json!({
                 "avgCadence": round_to(lap_steps as f64 / (lap_t as f64 / 60.0), 2),
-                "avgPace": round_to(lap_t as f64 / (lap_d / 1000.0).max(0.001), 2),
-                "avgStride": round_to(lap_d / 1.max(lap_steps) as f64, 2),
+                // 原项目单位：avgPace=分钟/公里；avgStride=米×100
+                "avgPace": round_to((lap_t as f64 / 60.0) / (lap_d / 1000.0).max(0.001), 2),
+                "avgStride": round_to(lap_d / 1.max(lap_steps) as f64 * 100.0, 2),
                 "cumulativeDuration": t_now,
                 "distance": round_to(lap_d, 4),
                 "duration": lap_t,
@@ -278,7 +342,55 @@ fn build_laps(track: &Track, start_ms: i64) -> Vec<Value> {
     laps
 }
 
-/// 组装 10 键 OBS 对象（值均 gzip+base64；segment_json/runFaceCheck 为空串 gzip）。
+/// 生成分段有效性列表（逆向 AnalysisStateDB）。
+///
+/// 详情页 native 地图按 `segment_json` 决定每段颜色：`state==0` 为有效（彩色），
+/// 非 0（256/512/65536/131072…）为无效（灰色）。空 segment_json 会让整条轨迹判灰，
+/// 因此这里按 1 分钟切段并全部标记 `state=0`（配速本身已在有效窗口内）。
+fn build_segments(track: &Track, start_ms: i64) -> Vec<Value> {
+    let locs = &track.locations;
+    if locs.is_empty() {
+        return Vec::new();
+    }
+    let avg_step = (track.totalSteps as f64 / track.totalTime.max(1) as f64 * 60.0).round() as i64;
+    let mut segs = Vec::new();
+    let mut seg_start_t = 0i64;
+    let mut seg_start_d = 0.0f64;
+    let mut seg_start_steps = 0i64;
+    for (i, pt) in locs.iter().enumerate() {
+        let last = i == locs.len() - 1;
+        if pt.totalTime - seg_start_t >= 60 || last {
+            let dur = 1i64.max(pt.totalTime - seg_start_t);
+            let dist = (pt.totalDis - seg_start_d).max(0.0);
+            let steps = (pt.steps - seg_start_steps).max(0);
+            let avg_speed = round_to(if dur > 0 { dist / dur as f64 } else { 0.0 }, 3);
+            segs.push(json!({
+                "id": segs.len() as i64 + 1,
+                "flag": start_ms,
+                "startTime": start_ms + seg_start_t * 1000,
+                "endTime": start_ms + pt.totalTime * 1000,
+                "distance": round_to(dist, 4),
+                "avgSpeed": avg_speed,
+                "avgStep": steps * 60 / dur,
+                "originAvgStep": avg_step,
+                "intervalStepModel": 0,
+                "speedStandard": 0,
+                "state": 0,
+            }));
+            seg_start_t = pt.totalTime;
+            seg_start_d = pt.totalDis;
+            seg_start_steps = pt.steps;
+        }
+    }
+    segs
+}
+
+/// 分段数量（供日志确认 detail 地图彩色/灰色）。
+pub fn segment_count(track: &Track) -> usize {
+    build_segments(track, track.startTime).len()
+}
+
+/// 组装 11 键 OBS 对象（值均 gzip+base64；runFaceCheck 为空串 gzip）。
 ///
 /// `five_wrapper` 为五点 wrapper 串（PointJsonEntity 外壳）；None 时按 live_points 现拼。
 pub fn build_obs_object(
@@ -294,6 +406,8 @@ pub fn build_obs_object(
     let run_wrap = json!({ "allLocJson": Value::Array(pts).to_string(), "useZip": false });
     let (sp, stf) = build_windows(track, rrid);
     let laps = build_laps(track, start_ms);
+    // 分段有效性（决定详情地图彩色/灰色）
+    let segments = build_segments(track, start_ms);
     let fx_raw = match five_wrapper {
         Some(w) => w.to_string(),
         None => {
@@ -309,17 +423,22 @@ pub fn build_obs_object(
         }
     };
     let fx: Value = serde_json::from_str(&fx_raw).unwrap_or(json!({}));
+    // 键与官方 o0OO00O.OooO0O0() 对齐（11 键）：rrid, uid, uuid, run_data,
+    // step_freq_json, speed_json, segment_json, fixed_point_json, runFaceCheck,
+    // extension_json, laps_json。extension_json 由 RunExtensionJsonHelper 产出，
+    // 无扩展时为空串 gzip（与 segment_json/runFaceCheck 同处理）。
     json!({
         "rrid": gz_str(&rrid.to_string()),
-        "uuid": gz_str(uuid),
         "uid": gz_str(&uid.to_string()),
+        "uuid": gz_str(uuid),
         "run_data": gz_json(&run_wrap),
-        "fixed_point_json": gz_json(&fx),
-        "segment_json": gz_str(""),
-        "speed_json": gz_json(&Value::Array(sp)),
         "step_freq_json": gz_json(&Value::Array(stf)),
-        "laps_json": gz_json(&Value::Array(laps)),
+        "speed_json": gz_json(&Value::Array(sp)),
+        "segment_json": gz_json(&Value::Array(segments)),
+        "fixed_point_json": gz_json(&fx),
         "runFaceCheck": gz_str(""),
+        "extension_json": gz_str(""),
+        "laps_json": gz_json(&Value::Array(laps)),
     })
 }
 

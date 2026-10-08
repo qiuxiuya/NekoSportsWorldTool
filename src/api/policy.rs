@@ -14,6 +14,8 @@ pub struct PolicyInfo {
     pub valid_time: i64,
     /// 必经点（BD 系，与打卡点同系），policy 响应里若有则返回。
     pub must_points: Vec<(f64, f64)>,
+    /// 运行区域元数据（详情页绿色围栏/目标点来源）。
+    pub area: crate::track::wire::RunAreaMeta,
 }
 
 /// 从 policy 响应 `data` 中防御式提取必经点列表（字段名不确定，逐个尝试）。
@@ -78,5 +80,6 @@ pub fn fetch_policy(client: &mut ApiClient) -> Result<PolicyInfo, String> {
             .unwrap_or(1000),
         valid_time: rule.get("validTime").and_then(|t| t.as_i64()).unwrap_or(0),
         must_points: extract_must_points(&biz),
+        area: super::points::area_from_payload(&biz, &[]),
     })
 }
