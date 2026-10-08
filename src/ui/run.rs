@@ -159,6 +159,13 @@ impl RunPage {
     pub fn reparse_custom(&mut self) {
         let text = self.custom_text.clone();
         self.preview_stale = true;
+        // 高德模式下文本框内容是本应用写入的 BD-09，始终按 BD-09 解析，避免用户切换
+        // 显示基准后解析结果漂移（几何已由 active_points_bd 的转换为 BD-09 保持一致）。
+        let parse_datum = if self.route_mode == RouteMode::Amap {
+            crate::track::custom::Datum::Bd09
+        } else {
+            self.custom_datum
+        };
         // 路径点变化后旧的沿路规划结果失效，需重新点「规划道路」。
         self.amap_points_bd = None;
         self.amap_msg.clear();
@@ -170,7 +177,7 @@ impl RunPage {
             let _ = crate::api::model::save_custom_route(&text);
             return;
         }
-        match crate::track::custom::parse_route(&text, self.custom_datum) {
+        match crate::track::custom::parse_route(&text, parse_datum) {
             Ok(parsed) => {
                 self.custom_msg = format!("√ {} · {} 个点", parsed.format, parsed.points_bd.len());
                 self.custom_points_bd = Some(parsed.points_bd);
@@ -710,7 +717,33 @@ impl App {
             ui.selectable_value(&mut page.custom_datum, Datum::Gcj02, "GCJ-02（高德）");
             ui.selectable_value(&mut page.custom_datum, Datum::Bd09, "BD-09（百度）");
             if page.custom_datum != before {
-                page.custom_dirty = true;
+                // 高德路径：点击基准即把文本框坐标换算到新基准（保持地理位置不变），
+                // 避免仅换解析基准导致整条路线漂移；GPX/GeoJSON 无法原地换算则退回重新解析。
+                let amap_ready = page.amap_points_bd.as_ref().is_some_and(|p| p.len() >= 2);
+                if amap
+                    && amap_ready
+                    && page.custom_points_bd.as_ref().is_some_and(|p| p.len() >= 2)
+                    && !page.custom_text.trim().is_empty()
+                {
+                    if let Some(converted) = crate::track::custom::convert_text_datum(
+                        &page.custom_text,
+                        before,
+                        page.custom_datum,
+                    ) {
+                        page.custom_text = converted;
+                        page.custom_text_seen = page.custom_text.clone();
+                        page.custom_dirty = true;
+                        page.custom_msg = format!(
+                            "√ 坐标基准 {} → {} 已自动换算",
+                            before.as_str(),
+                            page.custom_datum.as_str()
+                        );
+                    } else {
+                        page.custom_dirty = true;
+                    }
+                } else {
+                    page.custom_dirty = true;
+                }
             }
             let mut use_bld = page.custom_use_buildings;
             ui.checkbox(&mut use_bld, "用路网建筑模拟 GPS 漂移");
@@ -922,6 +955,20 @@ impl App {
             }
             match result {
                 Ok((points, len)) => {
+                    // 规划完成后把全部沿路点自动填入路径框，便于查看/复用；
+                    // 同步 text_seen 且清 dirty，避免下一帧 ensure_custom_parsed 重新解析把规划结果清掉。
+                    let text = points
+                        .iter()
+                        .map(|(la, lo)| format!("{la:.6},{lo:.6}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.run_page.custom_datum = crate::track::custom::Datum::Bd09;
+                    self.run_page.custom_points_bd = Some(points.clone());
+                    self.run_page.custom_text = text;
+                    self.run_page.custom_text_seen = self.run_page.custom_text.clone();
+                    self.run_page.custom_dirty = false;
+                    self.run_page.custom_msg =
+                        format!("√ 已沿道路规划 {} 个点（已自动填入）", points.len());
                     self.run_page.amap_points_bd = Some(points);
                     self.run_page.amap_msg = format!("沿道路规划完成：约 {:.0} m", len);
                     self.run_page.preview_stale = true;
@@ -1555,11 +1602,17 @@ mod tests {
             .unwrap()
             .timestamp_millis();
         let now_ms = crate::crypto::envelope::now_ms();
-        assert_eq!(
-            plan.start_ms,
-            want.min(now_ms),
-            "指定时刻未按 min(填入, 现在) 处理"
-        );
+        if want <= now_ms {
+            assert_eq!(plan.start_ms, want, "已过去的指定时刻应原样保留");
+        } else {
+            // 指定时刻仍在未来：start_ms 取「生成计划那一刻」的 now，与断言时刻存在毫秒级误差。
+            assert!(
+                plan.start_ms <= now_ms && now_ms - plan.start_ms < 1000,
+                "未来的指定时刻应钳制到生成时的当前时刻：start_ms={} now={}",
+                plan.start_ms,
+                now_ms
+            );
+        }
         assert_start_not_future(&plan);
     }
 

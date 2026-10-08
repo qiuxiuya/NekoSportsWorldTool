@@ -1,4 +1,4 @@
-w   //! 全链编排：policy → 实时点位 → 轨迹生成 → 提交 → OBS → 详情验证。
+//! 全链编排：policy → 实时点位 → 轨迹生成 → 提交 → OBS → 详情验证。
 //! 由 UI 后台线程调用，log 闭包回传日志。
 
 use super::client::ApiClient;
@@ -156,27 +156,6 @@ pub fn run_full_flow(
     }
     if let Some(&(slat, slon)) = route_pts.first() {
         log(&format!("√ [track] 起点 BD=({slat:.6},{slon:.6})"));
-    }
-    // 用打卡点随机偏移更新锚点并持久化：下次拉点位即学校真实坐标，摆脱写死的默认值
-    if !pts_bd.is_empty() {
-        let idx = (rand::random::<f64>() * pts_bd.len() as f64) as usize;
-        let (clat, clng) = pts_bd[idx];
-        let mut rng = rand::thread_rng();
-        let normal = Normal::<f64>::new(0.0, 120.0).unwrap();
-        let dlat =
-            normal.sample(&mut rng).clamp(-200.0, 200.0) / crate::track::geom::MET_PER_DEG_LAT;
-        let dlng =
-            normal.sample(&mut rng).clamp(-200.0, 200.0) / crate::track::geom::MET_PER_DEG_LNG;
-        client.identity.anchor_lat = clat + dlat;
-        client.identity.anchor_lon = clng + dlng;
-        if let Err(e) = super::model::save_identity(&client.identity) {
-            log(&format!("⚠ 锚点持久化失败: {e}"));
-        }
-        // 用漂移后的新锚点重存点位缓存，使缓存锚点与持久化锚点一致，避免预览锚点失配；
-        // 同时保留区域元数据，供下次详情页绿色围栏使用。
-        if let Ok(new_anchor) = client.identity.anchor_coordinate() {
-            let _ = super::model::save_points_cache_context(new_anchor, &pts, &points_ctx.area);
-        }
     }
     // 平均配速须落在有效窗口内（否则逐点速度无法全窗内），越界时修正时长
     let mut params = params.clone();
@@ -360,6 +339,25 @@ pub fn run_full_flow(
             track.locations.len()
         ));
     }
+
+    // 城市自动获取：开启后按轨迹起点逆地理编码（有高德 Key 用高德，否则免费 OSM），失败即报错中断。
+    if client.identity.city_auto {
+        let start = track
+            .locations
+            .first()
+            .ok_or("轨迹为空，无法自动获取城市")?;
+        log(&format!(
+            "[city] 城市自动模式：按轨迹起点({:.6},{:.6}) 逆地理编码…",
+            start.gLat, start.gLng
+        ));
+        let city = crate::api::amap::regeo_city_osm_bd(start.gLat, start.gLng)
+            .map_err(|e| format!("城市自动获取失败：{e}；可关闭城市自动或检查网络"))?;
+        log(&format!("√ [city] 已自动获取城市「{city}」"));
+        client.identity.city = city;
+        if let Err(e) = super::model::save_identity(&client.identity) {
+            log(&format!("⚠ 城市持久化失败: {e}"));
+        }
+    }
     log(&format!(
         "√ [track] {} 点 totalDis={:.0}m steps={} 起点={}",
         track.locations.len(),
@@ -371,6 +369,57 @@ pub fn run_full_flow(
             .map(|t| t.format("%H:%M:%S").to_string())
             .unwrap_or_default(),
     ));
+
+    // 锚点更新并持久化：下次拉点位即真实坐标，摆脱写死的默认值。
+    // 自动模式：以轨迹起点为基准，按设定距离/方位角偏移（设备页可配置）；
+    // 关闭自动：沿用打卡点随机漂移，保持原有行为。
+    {
+        let new_anchor_bd: Option<(f64, f64)> = match track.locations.first() {
+            Some(start) => match client
+                .identity
+                .auto_anchor(start.gLat, start.gLng)
+            {
+                Some((lat, lon)) => {
+                    log(&format!(
+                        "[points] 自动锚点：起点({:.6},{:.6}) 按 {:.0}m / {:.0}° 偏移 → ({lat:.6},{lon:.6})",
+                        start.gLat,
+                        start.gLng,
+                        client.identity.anchor_offset_m,
+                        client.identity.anchor_offset_bearing,
+                    ));
+                    Some((lat, lon))
+                }
+                None => {
+                    if pts_bd.is_empty() {
+                        None
+                    } else {
+                        let idx = (rand::random::<f64>() * pts_bd.len() as f64) as usize;
+                        let (clat, clng) = pts_bd[idx];
+                        let mut rng = rand::thread_rng();
+                        let normal = Normal::<f64>::new(0.0, 120.0).unwrap();
+                        let dlat = normal.sample(&mut rng).clamp(-200.0, 200.0)
+                            / crate::track::geom::MET_PER_DEG_LAT;
+                        let dlng = normal.sample(&mut rng).clamp(-200.0, 200.0)
+                            / crate::track::geom::MET_PER_DEG_LNG;
+                        Some((clat + dlat, clng + dlng))
+                    }
+                }
+            },
+            None => None,
+        };
+        if let Some((lat, lon)) = new_anchor_bd {
+            client.identity.anchor_lat = lat;
+            client.identity.anchor_lon = lon;
+            if let Err(e) = super::model::save_identity(&client.identity) {
+                log(&format!("⚠ 锚点持久化失败: {e}"));
+            }
+            // 用新锚点重存点位缓存，使缓存锚点与持久化锚点一致，避免预览锚点失配；
+            // 同时保留区域元数据，供下次详情页绿色围栏使用。
+            if let Ok(new_anchor) = client.identity.anchor_coordinate() {
+                let _ = super::model::save_points_cache_context(new_anchor, &pts, &points_ctx.area);
+            }
+        }
+    }
     let (ascent, descent, net) = track.elevation_stats();
     log(&format!(
         "[track] 海拔统计：起点 {:.2}m，终点 {:.2}m，累计爬升 {:.2}m，累计下降 {:.2}m，净变化 {:.2}m",

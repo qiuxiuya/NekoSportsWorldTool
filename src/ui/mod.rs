@@ -96,6 +96,11 @@ pub struct App {
     /// 高德步行规划后台结果：Ok((BD 折线, 沿路长度, 日志)) / Err((错误, 日志))。
     amap_tx: Sender<AmapPlanResult>,
     amap_rx: Receiver<AmapPlanResult>,
+    /// 逆地理编码（城市自动填充）后台结果。
+    geocode_tx: Sender<Result<String, String>>,
+    geocode_rx: Receiver<Result<String, String>>,
+    /// 逆地理编码进行中（状态挂在 App 上，避免随页面临时状态被覆盖）。
+    pub geocode_busy: bool,
 }
 
 /// 高德步行规划后台任务回传（成功：BD 折线 + 长度；失败：错误信息；均附日志）。
@@ -114,6 +119,7 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_messages();
+        self.poll_geocode();
         #[cfg(target_os = "android")]
         self.poll_device_info();
         crate::platform::set_keep_screen_on(self.run_busy || self.ai_busy || self.login_busy);
@@ -320,6 +326,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         let (net_tx, net_rx) = std::sync::mpsc::channel();
         let (amap_tx, amap_rx) = std::sync::mpsc::channel();
+        let (geocode_tx, geocode_rx) = std::sync::mpsc::channel();
         let font_loaded = fonts::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
         let identity = model::load_identity();
@@ -420,6 +427,9 @@ impl App {
             net_rx,
             amap_tx,
             amap_rx,
+            geocode_tx,
+            geocode_rx,
+            geocode_busy: false,
         };
         if app.font_loaded.is_none() {
             app.log

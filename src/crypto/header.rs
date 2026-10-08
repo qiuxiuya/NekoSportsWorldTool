@@ -41,6 +41,18 @@ pub struct HeaderIdentity {
     /// 提交 body 的城市名
     #[serde(default = "default_city")]
     pub city: String,
+    /// 锚点自动模式：开启后每次跑步以轨迹起点为基准偏移，覆盖手动锚点。
+    #[serde(default)]
+    pub anchor_auto: bool,
+    /// 自动锚点相对轨迹起点的偏移距离（米）。
+    #[serde(default = "default_anchor_offset_m")]
+    pub anchor_offset_m: f64,
+    /// 自动锚点偏移方位角（度，0=正北，90=正东，顺时针）。
+    #[serde(default)]
+    pub anchor_offset_bearing: f64,
+    /// 城市自动模式：开启后每次跑步按轨迹起点逆地理编码获取城市，失败则报错。
+    #[serde(default)]
+    pub city_auto: bool,
 }
 
 pub fn random_mac() -> String {
@@ -60,6 +72,7 @@ fn default_device_name() -> String { "iPhone".into() }
 fn default_anchor_lat() -> f64 { 38.901678 }
 fn default_anchor_lon() -> f64 { 121.540241 }
 fn default_city() -> String { "大连市".into() }
+fn default_anchor_offset_m() -> f64 { 200.0 }
 
 impl HeaderIdentity {
     /// 返回设备页配置的锚点，并执行统一边界校验。
@@ -72,6 +85,20 @@ impl HeaderIdentity {
         self.city.trim().is_empty()
             || self.city.trim() == crate::location::default_city()
             || self.anchor_coordinate().map(|c| c.is_default_dalian()).unwrap_or(true)
+    }
+
+    /// 自动锚点：以轨迹起点为基准，按配置的距离（米）与方位角偏移，返回 BD-09 坐标。
+    /// 关闭自动模式时返回 None（调用方保留手动锚点）。
+    pub fn auto_anchor(&self, start_bd_lat: f64, start_bd_lng: f64) -> Option<(f64, f64)> {
+        if !self.anchor_auto {
+            return None;
+        }
+        Some(crate::track::geom::offset_bd(
+            start_bd_lat,
+            start_bd_lng,
+            self.anchor_offset_m,
+            self.anchor_offset_bearing,
+        ))
     }
 
     /// 安装时间：持久值优先；缺失时按平台惯例回退（iOS 3 天 / Android 90 天前）。
@@ -106,6 +133,10 @@ impl Default for HeaderIdentity {
             app_install_time: 0,
             mac_address: String::new(),
             city: default_city(),
+            anchor_auto: false,
+            anchor_offset_m: default_anchor_offset_m(),
+            anchor_offset_bearing: 0.0,
+            city_auto: false,
         }
     }
 }

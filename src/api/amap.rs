@@ -18,6 +18,10 @@ use serde_json::Value;
 use crate::track::custom::Datum;
 
 const AMAP_WALKING_URL: &str = "https://restapi.amap.com/v5/direction/walking";
+/// 免费无 Key 逆地理编码（OSM Nominatim）。
+const NOMINATIM_REVERSE_URL: &str = "https://nominatim.openstreetmap.org/reverse";
+/// Nominatim 使用政策要求带可识别的 User-Agent。
+const NOMINATIM_UA: &str = "NekoSportsWorldTool/0.3 (+https://github.com/NekoSportsWorld)";
 /// 单段长度上限保护（米）：超长段仍可请求，此处仅用于日志提示。
 const STEP_M: f64 = 8.0;
 
@@ -186,6 +190,48 @@ fn fetch_segment(
         pts.windows(2).map(|w| haversine_m(w[0], w[1])).sum()
     };
     Ok((pts, len))
+}
+
+/// 逆地理编码（免费、无需 Key）：BD-09 坐标 → 城市名，使用 OSM Nominatim。
+///
+/// 入参需 WGS-84：内部依次 BD-09 → GCJ-02 → WGS-84。
+/// 只取**市级**行政单位：优先 `city`（地级市），其次 `municipality`（直辖市）、
+/// `state_district`（部分地区存放地级市），最后退到 `state`/`province`（省级）；
+/// 有意跳过 `county`/`district`/`town` 等区县镇级字段，避免提交出区级城市名。
+pub fn regeo_city_osm_bd(bd_lat: f64, bd_lng: f64) -> Result<String, String> {
+    let (glat, glng) = crate::track::wire::bd09_to_gcj02(bd_lat, bd_lng);
+    let (lat, lng) = crate::track::geom::gcj02_to_wgs84(glat, glng);
+    let url = format!(
+        "{NOMINATIM_REVERSE_URL}?format=jsonv2&zoom=10&accept-language=zh-CN&lat={lat:.6}&lon={lng:.6}"
+    );
+    let resp = ureq::get(&url)
+        .set("User-Agent", NOMINATIM_UA)
+        .timeout(std::time::Duration::from_secs(20))
+        .call()
+        .map_err(|e| format!("Nominatim 请求失败: {e}"))?;
+    let body = resp
+        .into_string()
+        .map_err(|e| format!("Nominatim 响应读取失败: {e}"))?;
+    let v: Value =
+        serde_json::from_str(&body).map_err(|e| format!("Nominatim 响应解析失败: {e}"))?;
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(format!("Nominatim 返回 {err}"));
+    }
+    let addr = v.get("address").ok_or("Nominatim 响应缺少 address")?;
+    let pick = |key: &str| -> String {
+        addr.get(key)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string()
+    };
+    for key in ["city", "municipality", "state_district", "state", "province"] {
+        let value = pick(key);
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    Err("Nominatim 未返回有效城市信息".into())
 }
 
 /// 走信封无关的裸 GET：返回响应体文本（高德 REST 不走业务信封）。

@@ -212,6 +212,19 @@ pub fn wgs84_to_gcj02(lat: f64, lng: f64) -> (f64, f64) {
     (lat + dlat, lng + dlng)
 }
 
+/// GCJ-02 → WGS84（`wgs84_to_gcj02` 的近似逆变换，三次迭代收敛到亚米级）。
+///
+/// OSM/Nominatim 等国际服务要求 WGS-84 入参。
+pub fn gcj02_to_wgs84(gcj_lat: f64, gcj_lng: f64) -> (f64, f64) {
+    let (mut wlat, mut wlng) = (gcj_lat, gcj_lng);
+    for _ in 0..3 {
+        let (glat, glng) = wgs84_to_gcj02(wlat, wlng);
+        wlat += gcj_lat - glat;
+        wlng += gcj_lng - glng;
+    }
+    (wlat, wlng)
+}
+
 /// GCJ-02 → BD-09（`wire::bd09_to_gcj02` 的逆变换）。
 pub fn gcj02_to_bd09(gcj_lat: f64, gcj_lng: f64) -> (f64, f64) {
     let z = (gcj_lng * gcj_lng + gcj_lat * gcj_lat).sqrt() + 0.00002 * (gcj_lat * X_PI).sin();
@@ -223,6 +236,44 @@ pub fn gcj02_to_bd09(gcj_lat: f64, gcj_lng: f64) -> (f64, f64) {
 pub fn wgs84_to_bd09(lat: f64, lng: f64) -> (f64, f64) {
     let (g_lat, g_lng) = wgs84_to_gcj02(lat, lng);
     gcj02_to_bd09(g_lat, g_lng)
+}
+
+/// BD-09 坐标按「距离（米）+ 方位角（度）」偏移，返回新的 BD-09 坐标。
+///
+/// 方位角 0=正北，90=正东，顺时针递增；距离按纬度/经度米-度常量换算，适合数百米级偏移。
+pub fn offset_bd(bd_lat: f64, bd_lng: f64, distance_m: f64, bearing_deg: f64) -> (f64, f64) {
+    let rad = bearing_deg.to_radians();
+    let dlat = distance_m * rad.cos() / MET_PER_DEG_LAT;
+    let dlng = distance_m * rad.sin() / MET_PER_DEG_LNG;
+    (bd_lat + dlat, bd_lng + dlng)
+}
+
+#[cfg(test)]
+mod offset_tests {
+    use super::*;
+
+    /// GCJ-02 → WGS84 反算后能还原原始 WGS84（迭代逆变换）。
+    #[test]
+    fn gcj02_to_wgs84_inverts_wgs84_offset() {
+        let wgs = (39.9042, 116.4074);
+        let (glat, glng) = wgs84_to_gcj02(wgs.0, wgs.1);
+        let (blat, blng) = gcj02_to_wgs84(glat, glng);
+        assert!((blat - wgs.0).abs() < 1e-6, "lat={blat}");
+        assert!((blng - wgs.1).abs() < 1e-6, "lng={blng}");
+    }
+
+    /// 正北偏移只改纬度、正东偏移只改经度，且距离换算正确。
+    #[test]
+    fn offset_bd_moves_along_the_requested_bearing() {
+        let (lat, lng) = (39.9, 116.4);
+        let (north_lat, north_lng) = offset_bd(lat, lng, 200.0, 0.0);
+        assert!((north_lat - lat - 200.0 / MET_PER_DEG_LAT).abs() < 1e-12);
+        assert!((north_lng - lng).abs() < 1e-12);
+
+        let (east_lat, east_lng) = offset_bd(lat, lng, 200.0, 90.0);
+        assert!((east_lat - lat).abs() < 1e-12);
+        assert!((east_lng - lng - 200.0 / MET_PER_DEG_LNG).abs() < 1e-12);
+    }
 }
 
 pub fn fmt_gain_time(ms: i64) -> String {

@@ -18,6 +18,37 @@ pub struct DevicePage {
 }
 
 impl App {
+    /// 后台请求逆地理编码：以当前锚点为基准自动填充城市（免费 OSM，无需 Key）。
+    pub(super) fn request_city_lookup(&mut self) {
+        if self.geocode_busy {
+            return;
+        }
+        let (lat, lng) = (self.device_buf.anchor_lat, self.device_buf.anchor_lon);
+        if crate::location::Coordinate::new(lat, lng, 0.0).is_err() {
+            self.status = "× 锚点坐标无效，无法查询城市".into();
+            return;
+        }
+        self.geocode_busy = true;
+        self.status = "正在用免费地图（OSM）按锚点查询城市…".into();
+        let tx = self.geocode_tx.clone();
+        std::thread::spawn(move || {
+            tx.send(crate::api::amap::regeo_city_osm_bd(lat, lng)).ok();
+        });
+    }
+
+    /// 接收逆地理编码结果并回填城市（后台线程 → UI）。
+    pub(super) fn poll_geocode(&mut self) {
+        let Ok(res) = self.geocode_rx.try_recv() else { return };
+        self.geocode_busy = false;
+        match res {
+            Ok(city) => {
+                self.device_buf.city = city.clone();
+                self.status = format!("√ 已按锚点自动填入城市「{city}」，请点击「保存」生效");
+            }
+            Err(e) => self.status = format!("× 城市查询失败：{e}"),
+        }
+    }
+
     #[cfg(target_os = "android")]
     pub(super) fn poll_device_info(&mut self) {
         let Some(reply) = crate::android::take_device_info() else { return };
@@ -102,10 +133,25 @@ impl App {
                 }
                 ui.label("城市：");
                 mobile::text_edit(ui, "device_city", &mut self.device_buf.city, crate::platform::InputKind::Text, ui.available_width());
+                {
+                    let busy = self.geocode_busy;
+                    let label = if busy { "查询城市中…" } else { "立即按锚点填城市" };
+                    if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                        self.request_city_lookup();
+                    }
+                }
+                ui.checkbox(&mut self.device_buf.city_auto, "城市自动（每次跑步自动获取，失败报错）");
                 ui.label("定位锚点纬度：");
                 mobile::drag_f64(ui, "device_lat", &mut self.device_buf.anchor_lat, -90.0..=90.0, 0.00001, 6);
                 ui.label("定位锚点经度：");
                 mobile::drag_f64(ui, "device_lon", &mut self.device_buf.anchor_lon, -180.0..=180.0, 0.00001, 6);
+                ui.checkbox(&mut self.device_buf.anchor_auto, "自动：以轨迹起点为基准偏移");
+                if self.device_buf.anchor_auto {
+                    ui.label("偏移距离（米）：");
+                    mobile::drag_f64(ui, "device_offset_m", &mut self.device_buf.anchor_offset_m, 0.0..=5000.0, 1.0, 1);
+                    ui.label("偏移方位角（度，0=正北）：");
+                    mobile::drag_f64(ui, "device_offset_bearing", &mut self.device_buf.anchor_offset_bearing, -360.0..=360.0, 1.0, 1);
+                }
             });
         } else {
             egui::Grid::new("device_grid")
@@ -130,7 +176,17 @@ impl App {
                         ui.end_row();
                     }
                     ui.label("城市：");
-                    mobile::text_edit(ui, "device_city", &mut self.device_buf.city, crate::platform::InputKind::Text, 120.0);
+                    ui.horizontal(|ui| {
+                        mobile::text_edit(ui, "device_city", &mut self.device_buf.city, crate::platform::InputKind::Text, 120.0);
+                        let busy = self.geocode_busy;
+                        let label = if busy { "查询城市中…" } else { "立即按锚点填城市" };
+                        if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                            self.request_city_lookup();
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("城市自动：");
+                    ui.checkbox(&mut self.device_buf.city_auto, "每次跑步自动获取，失败报错");
                     ui.end_row();
                     ui.label("定位锚点纬度：");
                     mobile::drag_f64(ui, "device_lat", &mut self.device_buf.anchor_lat, -90.0..=90.0, 0.00001, 6);
@@ -138,6 +194,17 @@ impl App {
                     ui.label("定位锚点经度：");
                     mobile::drag_f64(ui, "device_lon", &mut self.device_buf.anchor_lon, -180.0..=180.0, 0.00001, 6);
                     ui.end_row();
+                    ui.label("自动锚点：");
+                    ui.checkbox(&mut self.device_buf.anchor_auto, "以轨迹起点为基准偏移");
+                    ui.end_row();
+                    if self.device_buf.anchor_auto {
+                        ui.label("偏移距离（米）：");
+                        mobile::drag_f64(ui, "device_offset_m", &mut self.device_buf.anchor_offset_m, 0.0..=5000.0, 1.0, 1);
+                        ui.end_row();
+                        ui.label("偏移方位角（度，0=正北）：");
+                        mobile::drag_f64(ui, "device_offset_bearing", &mut self.device_buf.anchor_offset_bearing, -360.0..=360.0, 1.0, 1);
+                        ui.end_row();
+                    }
                 });
         }
 
@@ -145,6 +212,16 @@ impl App {
         ui.colored_label(
             theme::text_dim(),
             "定位锚点填写顺序：先填纬度，再填经度；地图常见的“经度,纬度”格式需要调换后填写。",
+        );
+        if self.device_buf.anchor_auto {
+            ui.colored_label(
+                theme::text_dim(),
+                "自动锚点：每次跑步完成后，以生成的轨迹起点为基准，按上述距离/方位角偏移后覆盖手动锚点并保存。",
+            );
+        }
+        ui.colored_label(
+            theme::text_dim(),
+            "城市：勾选「城市自动」后每次跑步按轨迹起点自动获取（失败报错）；也可点「立即按锚点填城市」手动刷新。均使用免费 OSM，无需 Key。",
         );
         ui.colored_label(
             theme::text_dim(),
@@ -217,6 +294,10 @@ fn location_fields_changed(saved: &HeaderIdentity, pending: &HeaderIdentity) -> 
     saved.city.trim() != pending.city.trim()
         || (saved.anchor_lat - pending.anchor_lat).abs() > 1e-9
         || (saved.anchor_lon - pending.anchor_lon).abs() > 1e-9
+        || saved.anchor_auto != pending.anchor_auto
+        || (saved.anchor_offset_m - pending.anchor_offset_m).abs() > 1e-9
+        || (saved.anchor_offset_bearing - pending.anchor_offset_bearing).abs() > 1e-9
+        || saved.city_auto != pending.city_auto
 }
 
 /// 整套随机：uuid v4 设备 ID（大写）；机型/系统按平台池抽取。

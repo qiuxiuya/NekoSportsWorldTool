@@ -11,7 +11,8 @@
 
 use quick_xml::events::{BytesStart, Event};
 
-use super::geom::{gcj02_to_bd09, wgs84_to_bd09};
+use super::geom::{gcj02_to_bd09, gcj02_to_wgs84, wgs84_to_bd09};
+use super::wire::bd09_to_gcj02;
 
 /// 导入文件的坐标基准。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -49,6 +50,46 @@ impl Datum {
             Datum::Gcj02 => gcj02_to_bd09(lat, lon),
             Datum::Bd09 => (lat, lon),
         }
+    }
+
+    /// BD-09 → 该基准下的经纬度（`to_bd09` 的逆向）。
+    pub fn from_bd09(self, lat: f64, lon: f64) -> (f64, f64) {
+        match self {
+            Datum::Bd09 => (lat, lon),
+            Datum::Gcj02 => bd09_to_gcj02(lat, lon),
+            Datum::Wgs84 => {
+                let (glat, glng) = bd09_to_gcj02(lat, lon);
+                gcj02_to_wgs84(glat, glng)
+            }
+        }
+    }
+}
+
+/// 将纯文本坐标（每行 `纬度,经度`）从 `from` 基准换算到 `to` 基准。
+///
+/// 返回 `None` 表示文本不是纯数值坐标（如 GPX/GeoJSON），调用方应退回「按新基准重新解析」。
+/// 换算保持地理位置不变：先统一到 BD-09，再转目标基准，避免切换基准后整条路线漂移。
+pub fn convert_text_datum(text: &str, from: Datum, to: Datum) -> Option<String> {
+    if from == to {
+        return Some(text.to_string());
+    }
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let (a, b) = t.split_once(',')?;
+        let lat = a.trim().parse::<f64>().ok()?;
+        let lon = b.trim().parse::<f64>().ok()?;
+        let (blat, blon) = from.to_bd09(lat, lon);
+        let (nlat, nlon) = to.from_bd09(blat, blon);
+        out.push(format!("{nlat:.7},{nlon:.7}"));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join("\n"))
     }
 }
 
@@ -302,5 +343,43 @@ mod tests {
     fn rejects_insufficient_points() {
         assert!(parse_route("", Datum::Wgs84).is_err());
         assert!(parse_route("38.9,121.5", Datum::Wgs84).is_err());
+    }
+
+    /// 同一地理位置在不同基准间换算后，再按目标基准解析回 BD-09 应与原几何一致。
+    #[test]
+    fn convert_text_datum_preserves_geometry() {
+        let wgs_text = "38.901678,121.540241\n38.902564,121.541233";
+        let base = parse_route(wgs_text, Datum::Wgs84).unwrap().points_bd;
+        for to in [Datum::Gcj02, Datum::Bd09] {
+            let converted = convert_text_datum(wgs_text, Datum::Wgs84, to).unwrap();
+            let roundtrip = parse_route(&converted, to).unwrap().points_bd;
+            for (a, b) in base.iter().zip(roundtrip.iter()) {
+                assert!((a.0 - b.0).abs() < 1e-5, "lat {a:?} vs {b:?} (Wgs84->{to:?})");
+                assert!((a.1 - b.1).abs() < 1e-5, "lon {a:?} vs {b:?} (Wgs84->{to:?})");
+            }
+        }
+        // 以 BD 文本为起点，再换回 GCJ/WGS 也应还原同一几何。
+        let bd_text = convert_text_datum(wgs_text, Datum::Wgs84, Datum::Bd09).unwrap();
+        let base_bd = parse_route(&bd_text, Datum::Bd09).unwrap().points_bd;
+        for to in [Datum::Wgs84, Datum::Gcj02] {
+            let converted = convert_text_datum(&bd_text, Datum::Bd09, to).unwrap();
+            let roundtrip = parse_route(&converted, to).unwrap().points_bd;
+            for (a, b) in base_bd.iter().zip(roundtrip.iter()) {
+                assert!((a.0 - b.0).abs() < 1e-5, "lat {a:?} vs {b:?} (Bd09->{to:?})");
+                assert!((a.1 - b.1).abs() < 1e-5, "lon {a:?} vs {b:?} (Bd09->{to:?})");
+            }
+        }
+    }
+
+    /// 非纯数值文本（GPX/GeoJSON）返回 None，调用方退回重新解析。
+    #[test]
+    fn convert_text_datum_rejects_non_numeric() {
+        assert!(convert_text_datum("<gpx></gpx>", Datum::Wgs84, Datum::Bd09).is_none());
+        assert!(convert_text_datum(r#"{"type":"LineString"}"#, Datum::Wgs84, Datum::Bd09).is_none());
+        // 相同基准直接原样返回。
+        assert_eq!(
+            convert_text_datum("38.9,121.5", Datum::Bd09, Datum::Bd09).as_deref(),
+            Some("38.9,121.5")
+        );
     }
 }
